@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+
 #include <deque>
 #include <boost/container/small_vector.hpp>
 
@@ -98,6 +100,10 @@ public:
     void UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write = false);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
+    /// Local change: queue an asynchronous download of the GPU-modified bytes in the page(s)
+    /// of a tiny GPU write (label/fence), so the page becomes CPU-readable without a drain.
+    void DownloadSmallAsync(VAddr addr, u64 size);
+
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool async = false,
                     bool assume_locks = false);
 
@@ -119,6 +125,8 @@ public:
 
     /// Mark region as modified from the GPU
     void MarkRegionAsGpuModified(VAddr addr, size_t size);
+    /// Local change: protect a region so a CPU read faults, without adding a buffer download range.
+    void MarkRegionForCpuReadback(VAddr addr, size_t size);
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
@@ -159,6 +167,7 @@ private:
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
     std::unique_ptr<MemoryTracker> memory_tracker;
+    absl::flat_hash_map<VAddr, u64> async_page_ticks; ///< page -> tick of pending DownloadSmallAsync
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;

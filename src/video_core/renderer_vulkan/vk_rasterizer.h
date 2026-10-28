@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -75,6 +77,11 @@ public:
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
+    void NoteTinyWritten(VAddr addr, u64 size);
+    void FlushTinyWritten();
+    bool IsRegionGpuModified(VAddr addr, u64 size) {
+        return buffer_cache.IsRegionGpuModified(addr, size);
+    }
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
@@ -139,6 +146,7 @@ private:
     Scheduler& scheduler;
     Runtime& runtime;
     VideoCore::PageManager page_manager;
+    boost::container::small_vector<std::pair<VAddr, u64>, 8> tiny_written;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
     AmdGpu::Liverpool* liverpool;

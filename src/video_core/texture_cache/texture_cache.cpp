@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <unordered_set>
 #include <limits>
 #include <xxhash.h>
 
@@ -187,6 +189,12 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(pages_start, pages_end - pages_start,
                          [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+
+    for (const auto image_id : image_ids) {
+        // Local change: a CPU write into an image awaiting an on-demand readback ends the
+        // readback and lifts the read protection, otherwise the write faults forever.
+        ForgetOndemandImage(image_id);
+    }
 
     for (const auto image_id : image_ids) {
         Image& image = slot_images[image_id];
@@ -704,14 +712,178 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
+// Local change: SHAD_READBACK_TILED=<max pixels> also queues GPU-written *tiled* images for
+// readback to guest memory. FIFA composites player kit/skin textures with the GPU into tiled
+// textures that the CPU then reads; without the readback the CPU sees stale memory and the
+// close-up player models (kit selection, warm-up) render white or as noise. The download path
+// already handles tiling via TileManager; upstream only enables it for linear images.
+static u64 ReadbackTiledMaxPixels() {
+    static const u64 value = [] {
+        const char* env = std::getenv("SHAD_READBACK_TILED");
+        if (!env || !*env) {
+            return u64{0};
+        }
+        const u64 v = std::strtoull(env, nullptr, 10);
+        // Default 256x256: the CPU-read composites are 32x8..128x128. Larger GPU-only images
+        // (render targets, shadow maps) must not be written back: by the time the deferred
+        // write lands the game may have reused that memory, e.g. for a thread stack.
+        return v == 0 || v == 1 ? u64{256 * 256} : v;
+    }();
+    return value;
+}
+
+static bool ShouldReadbackImage(const Image& image) {
+    if (!image.info.props.is_tiled || image.info.size.width <= 8) {
+        return true;
+    }
+    static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
+    const u32 w = image.info.size.width, h = image.info.size.height;
+    const u64 pixels = u64{w} * h;
+    bool ok = pixels <= ReadbackTiledMaxPixels();
+    // Exclude what is clearly a frame-sized render target or an HDR/depth/shadow buffer; the
+    // CPU never reads those back and each would cost a full download per frame.
+    switch (image.info.pixel_format) {
+    case vk::Format::eB10G11R11UfloatPack32:
+    case vk::Format::eR16G16B16A16Sfloat:
+    case vk::Format::eR32Sfloat:
+    case vk::Format::eD32Sfloat:
+    case vk::Format::eD32SfloatS8Uint:
+    case vk::Format::eD16Unorm:
+    case vk::Format::eD24UnormS8Uint:
+        ok = false;
+        break;
+    default:
+        break;
+    }
+    if (w == 1920 || w == 1280 || w == 960 || h == 1080 || h == 720 || h == 540) {
+        ok = false;
+    }
+    if (log_images) {
+        static std::unordered_set<u64> seen;
+        const u64 key = (image.info.guest_address * 1000003ULL) ^ (u64{w} << 32) ^ h;
+        if (seen.insert(key).second) {
+            LOG_INFO(Render_Vulkan, "TILEDRB {} addr={:#x} fmt={} {}x{} mips={}", ok ? "accept" : "reject",
+                     image.info.guest_address, vk::to_string(image.info.pixel_format), w, h,
+                     image.info.resources.levels);
+        }
+    }
+    return ok;
+}
+
+// Local change: tiled images are not read back eagerly after every GPU write (a 4096x4096 mask
+// written per frame costs a GPU stall each time). Instead the region is protected so the first
+// CPU read faults, and the download happens then (DownloadImagesForCpuRead). Set
+// SHAD_READBACK_EAGER=1 to restore the eager behaviour for tiled images too.
+void TextureCache::QueueReadback(ImageId image_id, Image& image) {
+    static const bool eager = std::getenv("SHAD_READBACK_EAGER") != nullptr;
+    std::unique_lock lk{download_images_mutex};
+    // Default on: every GPU-written image is read back on demand (first CPU read fault).
+    // SHAD_READBACK_EAGER_LINEAR=1 restores eager downloads of linear/tiny images.
+    static const bool all_ondemand = std::getenv("SHAD_READBACK_EAGER_LINEAR") == nullptr;
+    if (eager || (!all_ondemand && (!image.info.props.is_tiled || image.info.size.width <= 8))) {
+        static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
+        if (log_images) {
+            LOG_INFO(Render_Vulkan, "EAGER download addr={:#x} {}x{} fmt={} tiled={}",
+                     image.info.guest_address, image.info.size.width, image.info.size.height,
+                     vk::to_string(image.info.pixel_format), static_cast<bool>(image.info.props.is_tiled));
+        }
+        download_images.emplace(image_id);
+        return;
+    }
+    if (!ondemand_images.insert(image_id).second) {
+        return; // already protected and pending
+    }
+    static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
+    if (log_images) {
+        LOG_INFO(Render_Vulkan, "ONDEMAND protect addr={:#x} {}x{} fmt={}", image.info.guest_address,
+                 image.info.size.width, image.info.size.height, vk::to_string(image.info.pixel_format));
+    }
+    ProtectForCpuRead(image.info.guest_address, image.info.guest_size, true);
+}
+
+// Precise readbacks: reuse the buffer cache's GPU-modified tracking (it protects reads).
+// Relaxed/Disabled: that tracking never protects reads, so add our own read watchers on the
+// pages, refcounted per page so two images sharing a page do not double-track.
+void TextureCache::ProtectForCpuRead(VAddr addr, size_t size, bool protect) {
+    if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+        if (protect) {
+            buffer_cache.MarkRegionForCpuReadback(addr, size);
+        } else {
+            buffer_cache.UnmarkRegionAsGpuModified(addr, size, true);
+        }
+        return;
+    }
+    const VAddr first = PageManager::GetPageAddr(addr);
+    const VAddr last = PageManager::GetNextPageAddr(addr + size - 1);
+    for (VAddr page = first; page < last; page += 4096) {
+        auto& refs = ondemand_page_refs[page];
+        if (protect) {
+            if (refs++ == 0) {
+                page_manager.UpdateReadWatchers(page, 4096, PageOp::Track);
+            }
+        } else if (refs > 0) {
+            if (--refs == 0) {
+                page_manager.UpdateReadWatchers(page, 4096, PageOp::Untrack);
+                ondemand_page_refs.erase(page);
+            }
+        }
+    }
+}
+
+void TextureCache::DownloadImagesForCpuRead(VAddr addr, size_t size) {
+    boost::container::small_vector<std::pair<ImageId, bool>, 4> ids;
+    {
+        std::unique_lock lk{download_images_mutex};
+        if (ondemand_images.empty()) {
+            return;
+        }
+        // Protection is per page, so a fault on a page shared with an image must resolve the
+        // image even if the accessed bytes lie outside it (e.g. shader code next to a texture).
+        const auto pages_start = PageManager::GetPageAddr(addr);
+        const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+        ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
+            if (ondemand_images.contains(image_id)) {
+                ids.emplace_back(image_id, True(image.flags & ImageFlagBits::GpuModified));
+            }
+        });
+        for (const auto& [id, _] : ids) {
+            ondemand_images.erase(id);
+        }
+    }
+    for (const auto& [id, modified] : ids) {
+        static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
+        if (log_images) {
+            const auto& im = slot_images[id];
+            LOG_INFO(Render_Vulkan, "ONDEMAND download addr={:#x} {}x{} fmt={} modified={}",
+                     im.info.guest_address, im.info.size.width, im.info.size.height,
+                     vk::to_string(im.info.pixel_format), modified);
+        }
+        if (modified) {
+            DownloadImageMemory(id, DownloadMemoryFlags::Sync | DownloadMemoryFlags::DiscardBufferCache);
+        }
+        // Always lift the read protection of the whole image, so a page that the download
+        // did not cover (e.g. mip tail) cannot fault forever.
+        const auto& image = slot_images[id];
+        std::unique_lock lk{download_images_mutex};
+        ProtectForCpuRead(image.info.guest_address, image.info.guest_size, false);
+    }
+}
+
+void TextureCache::ForgetOndemandImage(ImageId image_id) {
+    std::unique_lock lk{download_images_mutex};
+    if (ondemand_images.erase(image_id)) {
+        const auto& image = slot_images[image_id];
+        ProtectForCpuRead(image.info.guest_address, image.info.guest_size, false);
+    }
+}
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+        if (readback_linear_images && ShouldReadbackImage(image) &&
             image.info.guest_address != 0) {
-            std::unique_lock lk{download_images_mutex};
-            download_images.emplace(image_id);
+            QueueReadback(image_id, image);
         }
     }
     UpdateImage(image_id);
@@ -746,9 +918,8 @@ void TextureCache::UnregisterMeta(VAddr address, u64 owner_uid) {
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
-        std::unique_lock lk{download_images_mutex};
-        download_images.emplace(image_id);
+    if (readback_linear_images && ShouldReadbackImage(image)) {
+        QueueReadback(image_id, image);
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
@@ -841,6 +1012,24 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
+    if (log_images) {
+        const auto& i = image.info;
+        static std::unordered_set<u64> seen;
+        const u64 key = (i.guest_address * 1000003ULL) ^ (static_cast<u64>(i.pixel_format) << 48) ^
+                        (static_cast<u64>(i.size.width) << 32) ^ (static_cast<u64>(i.size.height) << 16) ^
+                        i.resources.levels;
+        if (seen.insert(key).second) {
+        LOG_INFO(Render_Vulkan,
+                 "IMGUP addr={:#x} fmt={} {}x{}x{} mips={} layers={} pitch={} bits={} tile={} "
+                 "array={} tiled={} block={} pow2={} guest_size={:#x}",
+                 i.guest_address, vk::to_string(i.pixel_format), i.size.width, i.size.height,
+                 i.size.depth, i.resources.levels, i.resources.layers, i.pitch, i.num_bits,
+                 static_cast<int>(i.tile_mode), static_cast<int>(i.array_mode),
+                 static_cast<u32>(i.props.is_tiled), static_cast<u32>(i.props.is_block),
+                 static_cast<u32>(i.props.is_pow2), i.guest_size);
+        }
+    }
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
@@ -1229,6 +1418,7 @@ void TextureCache::TouchImage(Image& image) {
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {
+    ForgetOndemandImage(image_id);
     Image& image = slot_images[image_id];
     ASSERT_MSG(image.IsUntracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");

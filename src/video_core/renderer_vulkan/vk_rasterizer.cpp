@@ -1,3 +1,6 @@
+#include <execinfo.h>
+#include <atomic>
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -232,6 +235,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     DebugState.IncDrawCall();
 
     ResetBindings(false);
+    FlushTinyWritten();
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -314,6 +318,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     ResetBindings(false);
+    FlushTinyWritten();
 }
 
 void Rasterizer::DispatchDirect() {
@@ -349,6 +354,7 @@ void Rasterizer::DispatchDirect() {
     DebugState.IncDispatch();
 
     ResetBindings(true);
+    FlushTinyWritten();
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -383,6 +389,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     DebugState.IncDispatch();
 
     ResetBindings(true);
+    FlushTinyWritten();
 }
 
 u64 Rasterizer::Flush() {
@@ -397,6 +404,7 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    FlushTinyWritten();
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
@@ -404,7 +412,33 @@ void Rasterizer::OnSubmit() {
 }
 
 void Rasterizer::OnFence() {
+    FlushTinyWritten();
     texture_cache.ProcessDownloadImages();
+}
+
+void Rasterizer::NoteTinyWritten(VAddr addr, u64 size) {
+    static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
+    if (no_async) {
+        return;
+    }
+    for (const auto& [a, s] : tiny_written) {
+        if (a == addr) {
+            return;
+        }
+    }
+    if (tiny_written.size() < 64) {
+        tiny_written.emplace_back(addr, size);
+    }
+}
+
+void Rasterizer::FlushTinyWritten() {
+    if (tiny_written.empty()) {
+        return;
+    }
+    for (const auto& [addr, size] : tiny_written) {
+        buffer_cache.DownloadSmallAsync(addr, size);
+    }
+    tiny_written.clear();
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -822,6 +856,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 VideoCore::ObtainBufferFlags flags = {};
                 if (desc.is_written) {
                     flags |= VideoCore::ObtainBufferFlags::IsWritten;
+                    // Local change: a tiny shader-written buffer is a counter/label the CPU
+                    // polls (FIFA: 3 x 8 bytes per frame). Remember it and queue an async
+                    // download at the next fence so the poll does not fault and drain the GPU.
+                    if (size <= 64) {
+                        NoteTinyWritten(vsharp.base_address, size);
+                    }
                 }
                 if (desc.is_formatted) {
                     flags |= VideoCore::ObtainBufferFlags::IsTexelBuffer;
@@ -1203,6 +1243,10 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    static const bool log_readbacks = std::getenv("SHAD_LOG_GPUWRITES") != nullptr;
+    if (log_readbacks && !is_gds) {
+        LOG_INFO(Render, "GPUWRITE fill addr={:#x} size={}", address, num_bytes);
+    }
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
@@ -1221,9 +1265,19 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
                                          VideoCore::ObtainBufferFlags::IsWritten);
     }();
     runtime.FillBuffer(buffer, offset, num_bytes, value);
+    if (!is_gds && num_bytes <= 64) {
+        static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
+        if (!no_async) {
+            buffer_cache.DownloadSmallAsync(address, num_bytes);
+        }
+    }
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    static const bool log_readbacks = std::getenv("SHAD_LOG_GPUWRITES") != nullptr;
+    if (log_readbacks && !dst_gds) {
+        LOG_INFO(Render, "GPUWRITE copy dst={:#x} size={} src_gds={}", dst, num_bytes, src_gds);
+    }
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -1255,6 +1309,12 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         .size = num_bytes,
     };
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
+    if (!dst_gds && num_bytes <= 64) {
+        static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
+        if (!no_async) {
+            buffer_cache.DownloadSmallAsync(dst, num_bytes);
+        }
+    }
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
@@ -1269,6 +1329,20 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    // Local change: a CPU write into a page of an image that still awaits its on-demand
+    // readback must not discard that readback (the game writes next to / into composites it
+    // later reads back: kit and face textures came out wrong). Download first, then invalidate.
+    static const bool keep_pending = std::getenv("SHAD_DROP_PENDING_ON_WRITE") == nullptr;
+    if (keep_pending) {
+        const auto image_flush = [this, addr, size] {
+            texture_cache.DownloadImagesForCpuRead(addr, size);
+        };
+        if (assume_locks) {
+            image_flush();
+        } else {
+            liverpool->SendCommand<true>(image_flush);
+        }
+    }
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
     return true;
@@ -1278,6 +1352,34 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
+    }
+    // Local diagnostic: SHAD_LOG_READBACKS=1 logs every CPU read fault on GPU-written memory
+    // (address, size, GPU thread or not) so the per-frame readback hot spots can be found.
+    static const bool log_readbacks = std::getenv("SHAD_LOG_READBACKS") != nullptr;
+    if (log_readbacks) {
+        LOG_INFO(Render, "READBACK addr={:#x} size={} gpu_thread={}", addr, size, assume_locks);
+        // GPU-thread read faults: dump a raw backtrace for the first few and then every 500th,
+        // symbolicated offline against the binary's symbol table.
+        static std::atomic<u32> gpu_faults{0};
+        if (assume_locks) {
+            const u32 n = gpu_faults.fetch_add(1);
+            if (n < 8 || n % 500 == 0) {
+                void* frames[24];
+                const int count = backtrace(frames, 24);
+                std::string bt;
+                for (int i = 0; i < count; ++i) {
+                    bt += fmt::format("{:#x} ", reinterpret_cast<uintptr_t>(frames[i]));
+                }
+                LOG_INFO(Render, "READBACK-BT n={} {}", n, bt);
+            }
+        }
+    }
+    // Local change: GPU-written tiled images are downloaded on the first CPU read.
+    const auto image_flush = [this, addr, size] { texture_cache.DownloadImagesForCpuRead(addr, size); };
+    if (assume_locks) {
+        image_flush();
+    } else {
+        liverpool->SendCommand<true>(image_flush);
     }
     buffer_cache.ReadMemory(addr, size, false, false, assume_locks);
     return true;

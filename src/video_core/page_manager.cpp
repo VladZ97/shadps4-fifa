@@ -115,7 +115,7 @@ struct PageManager::Impl {
         locks.reserve(start_page, end_page);
     }
 
-    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
+    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op, bool is_read = false) {
         const u64 page_start = addr >> PM_PAGE_BITS;
         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
 
@@ -156,7 +156,8 @@ struct PageManager::Impl {
             }
 
             // Apply the change to the page state
-            const auto new_perms = state->Update(write_op);
+            const auto new_perms = is_read ? state->Update(PageOp::None, false, write_op, true)
+                                            : state->Update(write_op);
             if (new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
                 release_pending();
@@ -426,8 +427,12 @@ struct SignalImpl : public PageManager::Impl {
         RENDERER_TRACE;
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
-        ASSERT_MSG(perms != Core::MemoryPermission::Write,
-                   "Attempted to protect region as write-only which is not a valid permission");
+        // Local change: a region with only a read watcher (image awaiting a CPU readback) would
+        // need write-only protection, which does not exist. Block both; a write fault is
+        // handled by InvalidateMemory like any other CPU write.
+        if (perms == Core::MemoryPermission::Write) {
+            perms = Core::MemoryPermission::None;
+        }
         impl.Protect(address, size, perms);
     }
 
@@ -473,6 +478,10 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
 
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const {
     impl->UpdatePageWatchers(addr, size, write_op);
+}
+
+void PageManager::UpdateReadWatchers(VAddr addr, u64 size, PageOp read_op) const {
+    impl->UpdatePageWatchers(addr, size, read_op, true);
 }
 
 void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,

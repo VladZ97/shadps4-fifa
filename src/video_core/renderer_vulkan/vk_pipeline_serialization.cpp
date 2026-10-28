@@ -320,11 +320,21 @@ void PipelineCache::WarmUp() {
                                            std::move(profile_data));
         return;
     }
+    // Local change: an incompatible cache is retired and replaced instead of being ignored,
+    // otherwise the emulator runs without any cache forever (every session recompiles).
+    const auto start_fresh = [&] {
+        Storage::DataBase::Instance().RetireAndReopen();
+        Storage::DataBase::Instance().FinishPreload();
+        std::vector<u8> fresh(sizeof(profile));
+        std::memcpy(fresh.data(), &profile, sizeof(profile));
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                           std::move(fresh));
+    };
     if (profile_data.size() != sizeof(Shader::Profile)) {
         LOG_WARNING(Render,
-                    "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
+                    "Pipeline cache profile has unexpected size ({} != {}). Replacing the cache",
                     profile_data.size(), sizeof(Shader::Profile));
-        Storage::DataBase::Instance().Close();
+        start_fresh();
         return;
     }
 
@@ -332,8 +342,8 @@ void PipelineCache::WarmUp() {
     std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
     if (cached_profile != profile) {
         LOG_WARNING(Render,
-                    "Pipeline cache isn't compatible with current system. Ignoring the cache");
-        Storage::DataBase::Instance().Close();
+                    "Pipeline cache isn't compatible with current system. Replacing the cache");
+        start_fresh();
         return;
     }
 

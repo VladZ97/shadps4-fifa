@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <thread>
 #include <boost/asio/io_context.hpp>
 
@@ -83,11 +84,19 @@ static PS4_SYSV_ABI void stack_chk_fail() {
     void* caller = __builtin_return_address(0);
     auto* linker = Common::Singleton<Core::Linker>::Instance();
     auto* mod = linker ? linker->FindByAddress(reinterpret_cast<VAddr>(caller)) : nullptr;
+    // Local change: SHAD_STACK_CHK_IGNORE=1 logs the failed stack check and lets the game
+    // continue. Useful when the overflow is a few bytes that only reach the canary.
+    static const bool ignore = std::getenv("SHAD_STACK_CHK_IGNORE") != nullptr;
     if (mod) {
-        LOG_CRITICAL(Lib_Kernel, "called from {:p} (module: {}, offset: {:#x})", caller, mod->name,
-                     reinterpret_cast<VAddr>(caller) - mod->GetBaseAddress());
+        LOG_CRITICAL(Lib_Kernel, "called from {:p} (module: {}, offset: {:#x}){}", caller, mod->name,
+                     reinterpret_cast<VAddr>(caller) - mod->GetBaseAddress(),
+                     ignore ? " - ignored" : "");
     } else {
-        LOG_CRITICAL(Lib_Kernel, "called from {:p} (unknown module)", caller);
+        LOG_CRITICAL(Lib_Kernel, "called from {:p} (unknown module){}", caller,
+                     ignore ? " - ignored" : "");
+    }
+    if (ignore) {
+        return;
     }
     UNREACHABLE();
 }

@@ -120,6 +120,12 @@ public:
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 
+    /// Local change: download GPU-written images overlapping a region the CPU is reading now.
+    void DownloadImagesForCpuRead(VAddr addr, size_t size);
+    void QueueReadback(ImageId image_id, Image& image);
+    void ForgetOndemandImage(ImageId image_id);
+    void ProtectForCpuRead(VAddr addr, size_t size, bool protect);
+
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
@@ -412,6 +418,8 @@ private:
     TileManager tile_manager;
     absl::flat_hash_map<u64, SamplerId> samplers;
     absl::flat_hash_set<ImageId> download_images;
+    absl::flat_hash_set<ImageId> ondemand_images; ///< tiled images awaiting a CPU read fault
+    absl::flat_hash_map<VAddr, u32> ondemand_page_refs; ///< read-watcher refcount per page (relaxed mode)
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;

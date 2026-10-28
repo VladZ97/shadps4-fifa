@@ -4,6 +4,7 @@
 #include <utility>
 #include "common/assert.h"
 #include "shader_recompiler/frontend/decode.h"
+#include "video_core/amdgpu/regs_shader.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/frontend/opcodes.h"
 
@@ -53,7 +54,10 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
     };
     std::array<VsharpLoad, 104> loads{};
 
-    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    const auto* guest_code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    // Local change: parse through the backing alias (see GetParams) to avoid read faults.
+    const auto* backing = AmdGpu::ShaderCodeBacking(guest_code, 4096);
+    const auto* code = backing ? backing : guest_code;
     const u32* ptr = code;
     while (true) {
         const u32 word0 = *(ptr++);

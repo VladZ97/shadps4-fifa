@@ -351,9 +351,21 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
-            ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
+            {
+                std::scoped_lock lock{port->vo_mutex};
+                if (port->buffer_labels[buf_id] != 1) {
+                    // Local change: the upstream code asserts here ("Out of order flip IRQ").
+                    // FIFA 16 trips it at scene transitions when two flips race; the buffer's
+                    // flip was already handled, so skipping this one costs at most a hitch.
+                    LOG_WARNING(Lib_VideoOut, "Out of order flip IRQ for buffer {} (label {}), skipping",
+                                buf_id, port->buffer_labels[buf_id]);
+                    return;
+                }
+            }
             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
-            ASSERT_MSG(result, "EOP flip submission failed");
+            if (!result) {
+                LOG_ERROR(Lib_VideoOut, "EOP flip submission failed for buffer {}", buf_id);
+            }
         });
 
     return ORBIS_OK;

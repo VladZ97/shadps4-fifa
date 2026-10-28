@@ -6,6 +6,7 @@
 
 #include "common/string_util.h"
 #include "core/file_sys/backends/host_fs.h"
+#include "core/file_sys/dir_index.h"
 #include "core/file_sys/fs.h"
 
 namespace Core::FileSys {
@@ -131,10 +132,6 @@ std::filesystem::path HostFsBackend::Resolve(std::string_view rel_path) const {
     if constexpr (!NeedsCaseInsensitiveSearch) {
         return direct;
     } else {
-        std::error_code ec;
-        if (std::filesystem::exists(direct, ec)) {
-            return direct;
-        }
         return ResolveCaseInsensitive(rel_path).value_or(std::move(direct));
     }
 }
@@ -162,35 +159,27 @@ std::optional<std::filesystem::path> HostFsBackend::ResolveCaseInsensitive(
             continue;
         }
 
-        if (std::filesystem::path candidate = current / part_str;
-            std::filesystem::exists(candidate, ec)) {
-            current = std::move(candidate);
-            m_case_cache.emplace(prefix, current);
-            continue;
-        }
-
-        const std::string part_low = Common::ToLower(part_str);
-        bool found = false;
-        for (const auto& entry : std::filesystem::directory_iterator(current, ec)) {
-            const auto name = entry.path().filename();
-            if (Common::ToLower(name.string()) != part_low) {
-                continue;
-            }
-            current /= name;
-            m_case_cache.emplace(prefix, current);
-            found = true;
-            break;
-        }
-        if (!found) {
+        // Local change: one cached listing per directory instead of stat + directory scan.
+        const auto actual = DirIndex::Instance().Lookup(current, part_str);
+        if (!actual) {
             return std::nullopt;
         }
+        current /= *actual;
+        m_case_cache.emplace(prefix, current);
     }
     return current;
 }
 
 bool HostFsBackend::Exists(std::string_view rel_path) {
-    std::error_code ec;
-    return std::filesystem::exists(Resolve(rel_path), ec);
+    if constexpr (NeedsCaseInsensitiveSearch) {
+        if (rel_path.empty()) {
+            return true;
+        }
+        return ResolveCaseInsensitive(rel_path).has_value();
+    } else {
+        std::error_code ec;
+        return std::filesystem::exists(Resolve(rel_path), ec);
+    }
 }
 
 bool HostFsBackend::IsDirectory(std::string_view rel_path) {
@@ -225,6 +214,9 @@ std::unique_ptr<IFile> HostFsBackend::Open(std::string_view rel_path,
     auto handle = std::make_unique<HostFile>(path, mode, m_read_only || !writable);
     if (!handle->IsOpen()) {
         return nullptr;
+    }
+    if (mode == Common::FS::FileAccessMode::Create) {
+        DirIndex::Instance().InvalidateParent(path);
     }
     return handle;
 }

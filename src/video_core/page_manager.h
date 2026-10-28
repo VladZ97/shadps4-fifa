@@ -41,6 +41,9 @@ public:
     /// Updates watches in the pages touching the specified region.
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const;
 
+    /// Local change: adds/removes a READ watcher on the pages of a region (CPU reads then fault).
+    void UpdateReadWatchers(VAddr addr, u64 size, PageOp read_op) const;
+
     /// Updates watches in the pages touching the inclusive bounds using a mask.
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,

@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -66,6 +67,7 @@ static constexpr bool UseNeoCompatSequences = false;
 // In case if `submitDone` is issued we need to block submissions until GPU idle
 static u32 submission_lock{};
 std::condition_variable cv_lock{};
+static std::mutex m_flip_submission{}; // local: serialize EOP flip submissions (upstream PR #5039)
 std::mutex m_wait_idle{};
 std::mutex m_submit_lock{};
 static u64 frames_submitted{};      // frame counter
@@ -1471,7 +1473,10 @@ s32 PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload(u64 workload, u32* gp
     }
     liverpool->SubmitGfx(dcb_span, {});
 
-    if (!liverpool->IsGpuIdle()) {
+    // Local change: SHAD_NO_SUBMISSION_LOCK=1 lets the game keep submitting while the previous
+    // frame is still being processed (use with SHAD_COPY_GPU_BUFFERS=1 so command buffers are copied).
+    static const bool no_submission_lock = std::getenv("SHAD_NO_SUBMISSION_LOCK") != nullptr;
+    if (!no_submission_lock && !liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
     liverpool->SubmitDone();
@@ -2377,6 +2382,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
 
+    std::scoped_lock flip_lock{m_flip_submission};
+
     if (count != 0) {
         if (!dcb_gpu_addrs) {
             LOG_ERROR(Lib_GnmDriver, "dcbGpuAddrs must not be NULL");
@@ -2474,7 +2481,10 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
-    if (!liverpool->IsGpuIdle()) {
+    // Local change: SHAD_NO_SUBMISSION_LOCK=1 lets the game keep submitting while the previous
+    // frame is still being processed (use with SHAD_COPY_GPU_BUFFERS=1 so command buffers are copied).
+    static const bool no_submission_lock = std::getenv("SHAD_NO_SUBMISSION_LOCK") != nullptr;
+    if (!no_submission_lock && !liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
     liverpool->SubmitDone();
@@ -3044,7 +3054,8 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
         sdk_version = 0;
     }
 
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
+    static const bool force_copy = std::getenv("SHAD_COPY_GPU_BUFFERS") != nullptr;
+    if (EmulatorSettings.IsCopyGpuBuffers() || force_copy) {
         liverpool->ReserveCopyBufferSpace();
     }
 

@@ -247,12 +247,21 @@ static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
     UNREACHABLE_MSG("Shader binary info not found.");
 }
 
-static constexpr Shader::ShaderParams GetParams(const auto& sh) {
-    const auto* code = sh.template Address<u32*>();
-    const auto& bininfo = SearchBinaryInfo(code);
+// Local change: shader code is read through the unprotected backing alias when possible.
+// FIFA keeps shader binaries on pages that GPU buffers also write to, so reading them through
+// the guest mapping faults (precise readbacks) and drains the GPU on every pipeline refresh.
+const u32* ShaderCodeBacking(const u32* code, u64 size);
+
+static inline Shader::ShaderParams GetParams(const auto& sh) {
+    const auto* guest_code = sh.template Address<u32*>();
+    const u32* code = ShaderCodeBacking(guest_code, 4096);
+    const auto& bininfo = SearchBinaryInfo(code ? code : guest_code);
+    if (code) {
+        code = ShaderCodeBacking(guest_code, bininfo.length + 64);
+    }
     return {
         .user_data = sh.user_data,
-        .code = std::span{code, bininfo.length / sizeof(u32)},
+        .code = std::span{code ? code : guest_code, bininfo.length / sizeof(u32)},
         .hash = bininfo.shader_hash,
     };
 }

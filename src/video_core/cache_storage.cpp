@@ -1,3 +1,4 @@
+#include <ctime>
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -118,6 +119,20 @@ void DataBase::Open() {
 
     io_worker = std::jthread{ProcessIO};
     opened = true;
+}
+
+void DataBase::RetireAndReopen() {
+    const auto stale = cache_path;
+    Close();
+    if (!EmulatorSettings.IsPipelineCacheArchived() && std::filesystem::exists(stale)) {
+        auto retired = stale;
+        retired += ".stale-" + std::to_string(std::time(nullptr));
+        std::error_code ec;
+        std::filesystem::rename(stale, retired, ec);
+        LOG_WARNING(Render, "Incompatible pipeline cache moved to {}; starting a fresh one",
+                    retired.string());
+    }
+    Open();
 }
 
 void DataBase::Close() {

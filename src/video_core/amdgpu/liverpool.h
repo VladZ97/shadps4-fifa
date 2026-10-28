@@ -1,3 +1,5 @@
+#include <array>
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -72,12 +74,30 @@ public:
     void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 
+    // Local change: with SHAD_NO_SUBMISSION_LOCK the copied command buffers are double-buffered
+    // by frame parity. SubmitDone switches to the other half and only resets it once every
+    // submit that used it (two frames ago) has been processed, allowing one frame of overlap
+    // between the game's render thread and the command processor.
+    bool OverlapSubmits() const noexcept {
+        static const bool overlap = std::getenv("SHAD_NO_SUBMISSION_LOCK") != nullptr;
+        return overlap;
+    }
+
     void SubmitDone() noexcept {
-        std::scoped_lock lk{submit_mutex};
-        mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
-        mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
+        std::unique_lock lk{submit_mutex};
+        auto& q = mapped_queues[GfxQueueId];
+        if (OverlapSubmits()) {
+            copy_parity ^= 1;
+            const u32 p = copy_parity;
+            submit_cv.wait(lk, [this, p] { return pending_by_parity[p] == 0; });
+            q.ccb_buffer_offset[p] = 0;
+            q.dcb_buffer_offset[p] = 0;
+        } else {
+            q.ccb_buffer_offset[0] = 0;
+            q.dcb_buffer_offset[0] = 0;
+        }
         submit_done = true;
-        submit_cv.notify_one();
+        submit_cv.notify_all();
     }
 
     void WaitGpuIdle() noexcept {
@@ -123,8 +143,12 @@ public:
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
         std::scoped_lock lk(gfx_queue.m_access);
         constexpr size_t GfxReservedSize = 2_MB >> 2;
-        gfx_queue.ccb_buffer.reserve(GfxReservedSize);
-        gfx_queue.dcb_buffer.reserve(GfxReservedSize);
+        for (auto& b : gfx_queue.ccb_buffer) {
+            b.reserve(GfxReservedSize);
+        }
+        for (auto& b : gfx_queue.dcb_buffer) {
+            b.reserve(GfxReservedSize);
+        }
     }
 
     inline ComputeProgram& GetCsRegs() {
@@ -199,13 +223,17 @@ private:
 
     struct GpuQueue {
         std::mutex m_access{};
-        std::atomic<u32> dcb_buffer_offset;
-        std::atomic<u32> ccb_buffer_offset;
-        std::vector<u32> dcb_buffer;
-        std::vector<u32> ccb_buffer;
+        std::array<std::atomic<u32>, 2> dcb_buffer_offset{};
+        std::array<std::atomic<u32>, 2> ccb_buffer_offset{};
+        std::array<std::vector<u32>, 2> dcb_buffer;
+        std::array<std::vector<u32>, 2> ccb_buffer;
         std::queue<Task::Handle> submits{};
+        std::queue<u8> submit_parity{}; ///< copy-buffer half used by each queued submit
         ComputeProgram cs_state{};
     };
+    u32 copy_parity{0};
+    std::array<std::atomic<u32>, 2> pending_by_parity{};
+    std::queue<u8> ce_parity{};
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     std::queue<Task::Handle> ce_submits;
     u32 num_mapped_queues{1u}; // GFX is always available

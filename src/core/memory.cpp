@@ -204,6 +204,27 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     return true;
 }
 
+void* MemoryManager::TryGetBacking(const void* address, u64 size) {
+    const VAddr virtual_addr = std::bit_cast<VAddr>(address);
+    std::shared_lock lk{mutex};
+    if (!IsValidMapping(virtual_addr, size)) {
+        return nullptr;
+    }
+    const auto vma_it = FindVMA(virtual_addr);
+    const auto& vma = vma_it->second;
+    if (!vma.Overlaps(virtual_addr, size) || !HasPhysicalBacking(vma) ||
+        virtual_addr + size > vma.base + vma.size) {
+        return nullptr;
+    }
+    const u64 start_in_vma = virtual_addr - vma.base;
+    const auto phys_handle = std::prev(vma.phys_areas.upper_bound(start_in_vma));
+    const u64 start_in_dma = start_in_vma - phys_handle->first;
+    if (start_in_dma + size > phys_handle->second.size) {
+        return nullptr;
+    }
+    return impl.BackingBase() + phys_handle->second.base + start_in_dma;
+}
+
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
     std::scoped_lock lk{mutex, unmap_mutex};
     alignment = alignment > 0 ? alignment : 64_KB;

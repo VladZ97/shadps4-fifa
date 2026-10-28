@@ -1,3 +1,4 @@
+#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -5,6 +6,7 @@
 #include <climits>
 #include <condition_variable>
 #include <cstdint>
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -35,6 +37,7 @@
 #include "core/file_sys/devices/zero_device.h"
 #include "core/file_sys/directories/normal_directory.h"
 #include "core/file_sys/directories/pfs_directory.h"
+#include "core/file_sys/dir_index.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/orbis_error.h"
@@ -148,7 +151,28 @@ void ReleaseFlockState(Core::FileSys::File* file) {
 
 } // anonymous namespace
 
+// Local diagnostic: time spent in opens that fail with ENOENT (FIFA's Lua candidate chains
+// probe tens of missing files per asset). Summary line every 500 failures.
+static void NoteFailedOpen(std::chrono::steady_clock::time_point t0) {
+    static std::atomic<u64> count{0}, spent_us{0}, max_us{0};
+    static std::atomic<s64> window_start{0};
+    const auto now = std::chrono::steady_clock::now();
+    const u64 us = std::chrono::duration_cast<std::chrono::microseconds>(now - t0).count();
+    spent_us += us;
+    u64 m = max_us.load();
+    while (us > m && !max_us.compare_exchange_weak(m, us)) {
+    }
+    const u64 n = ++count;
+    if (n % 500 == 0) {
+        const s64 now_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+        const s64 ws = window_start.exchange(now_us);
+        LOG_INFO(Kernel_Fs, "FSNEG n={} window_ms={} spent_ms={} max_us={}", n,
+                 ws ? (now_us - ws) / 1000 : 0, spent_us.exchange(0) / 1000, max_us.exchange(0));
+    }
+}
+
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
+    const auto open_t0 = std::chrono::steady_clock::now();
     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
 
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
@@ -192,7 +216,15 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
         LOG_ERROR(Kernel_Fs, "Opening path {} failed, invalid path", raw_path);
         return -1;
     }
-    const std::string& path = *sanitized_path;
+    std::string path = *sanitized_path;
+    if (!path.starts_with('/')) {
+        // Local change: FIFA's competition engine (with PC patch data) opens Windows-style
+        // relative paths such as "logs\conflict.txt" for debug logs and then writes through
+        // the handle without checking for failure. Give relative paths a writable home.
+        std::replace(path.begin(), path.end(), '\\', '/');
+        path = "/data/" + path;
+        LOG_WARNING(Kernel_Fs, "Relative path {} redirected to {}", raw_path, path);
+    }
     u32 handle = h->CreateHandle();
     auto* file = h->GetFile(handle);
 
@@ -239,12 +271,14 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
             }
             // Create a file if it doesn't exist
             Common::FS::IOFile out(file->m_host_name, Common::FS::FileAccessMode::Create);
+            Core::FileSys::DirIndex::Instance().InvalidateParent(file->m_host_name);
         }
     } else if (!exists) {
         // If we're not creating a file, and it doesn't exist, return ENOENT
         h->DeleteHandle(handle);
         *__Error() = POSIX_ENOENT;
         LOG_ERROR(Kernel_Fs, "Opening path {} failed, file does not exist", raw_path);
+        NoteFailedOpen(open_t0);
         return -1;
     }
 
@@ -700,6 +734,7 @@ s32 PS4_SYSV_ABI posix_mkdir(const char* path, u16 mode) {
     }
 
     std::error_code ec;
+    Core::FileSys::DirIndex::Instance().InvalidateParent(dir_name);
     if (dir_name.empty() || !fs::create_directory(dir_name, ec)) {
         if (ec == std::errc::no_such_file_or_directory) {
             *__Error() = POSIX_ENOENT;
@@ -764,6 +799,7 @@ s32 PS4_SYSV_ABI posix_rmdir(const char* path) {
         return -1;
     }
 
+    Core::FileSys::DirIndex::Instance().InvalidateParent(dir_name);
     fs::remove(dir_name, ec);
 
     if (ec == std::errc::directory_not_empty) {
@@ -1391,6 +1427,8 @@ s32 PS4_SYSV_ABI posix_rename(const char* from, const char* to) {
         return -1;
     }
     const auto dst_path = mnt->GetHostPath(to, &ro);
+    Core::FileSys::DirIndex::Instance().InvalidateParent(src_path);
+    Core::FileSys::DirIndex::Instance().InvalidateParent(dst_path);
     if (ro) {
         *__Error() = POSIX_EROFS;
         return -1;
@@ -1910,6 +1948,7 @@ s32 PS4_SYSV_ABI posix_unlink(const char* path) {
 
     bool ro = false;
     const auto host_path = mnt->GetHostPath(path, &ro);
+    Core::FileSys::DirIndex::Instance().InvalidateParent(host_path);
     if (host_path.empty()) {
         *__Error() = POSIX_ENOENT;
         return -1;

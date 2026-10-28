@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -20,6 +21,54 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
+
+// Local change: a small WriteData into a page that the GPU also writes used to go through the
+// guest mapping, fault, and drain the whole GPU before the write (precise readbacks). Instead
+// write the bytes to the backing alias (CPU pollers see them at once, no fault) and queue the
+// same dwords as GPU fills so the resident copy of the buffer matches and a later download of
+// that page cannot revert the label. SHAD_NO_LABEL_NOFAULT=1 restores the old behaviour.
+static bool WriteLabelNoFault(Vulkan::Rasterizer* rasterizer, void* address, const void* data,
+                              u32 data_size) {
+    static const bool enabled = std::getenv("SHAD_LABEL_NOFAULT") != nullptr;
+    if (!enabled || !rasterizer || data_size == 0 || data_size > 16 || data_size % 4 != 0 ||
+        reinterpret_cast<uintptr_t>(address) % 4 != 0) {
+        return false;
+    }
+    const VAddr addr = reinterpret_cast<VAddr>(address);
+    if (!rasterizer->IsRegionGpuModified(addr, data_size)) {
+        return false; // clean page: the plain write is cheap
+    }
+    auto* memory = Core::Memory::Instance();
+    if (!memory->TryWriteBacking(address, data, data_size)) {
+        return false;
+    }
+    const u32* dwords = static_cast<const u32*>(data);
+    for (u32 i = 0; i < data_size / sizeof(u32); ++i) {
+        rasterizer->FillBuffer(addr + i * sizeof(u32), sizeof(u32), dwords[i], false);
+    }
+    return true;
+}
+
+// Local change: see GetParams in regs_shader.h.
+const u32* ShaderCodeBacking(const u32* code, u64 size) {
+    static const bool disabled = std::getenv("SHAD_NO_BACKING_SHADERS") != nullptr;
+    if (disabled) {
+        return nullptr;
+    }
+    return static_cast<const u32*>(Core::Memory::Instance()->TryGetBacking(code, size));
+}
+
+// Local change: see WaitRegMem. Returns the backing-alias pointer of a memory label, or
+// nullptr (register waits, unbacked memory, or SHAD_NO_BACKING_POLL set).
+static const u32* BackingLabel(const PM4CmdWaitRegMem* wait) {
+    static const bool enabled = std::getenv("SHAD_BACKING_POLL") != nullptr;
+    if (!enabled || wait->mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
+        return nullptr;
+    }
+    return static_cast<const u32*>(
+        Core::Memory::Instance()->TryGetBacking(wait->Address<const void*>(), sizeof(u32)));
+}
+
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -77,6 +126,9 @@ Liverpool::~Liverpool() {
     while (!ce_submits.empty()) {
         ce_submits.front().destroy();
         ce_submits.pop();
+        if (!ce_parity.empty()) {
+            ce_parity.pop();
+        }
     }
     for (auto& queue : mapped_queues) {
         while (!queue.submits.empty()) {
@@ -101,6 +153,13 @@ void Liverpool::ProcessCeQueue() {
         task.destroy();
         std::scoped_lock lock{queue.m_access};
         ce_submits.pop();
+        if (!ce_parity.empty()) {
+            const u8 p = ce_parity.front();
+            ce_parity.pop();
+            if (p != 0xFF) {
+                --pending_by_parity[p];
+            }
+        }
         --num_submits;
         std::scoped_lock lock2{submit_mutex};
         submit_cv.notify_all();
@@ -165,9 +224,17 @@ void Liverpool::Process(std::stop_token stoken) {
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
+                u8 p = 0xFF;
+                if (!queue.submit_parity.empty()) {
+                    p = queue.submit_parity.front();
+                    queue.submit_parity.pop();
+                }
 
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
+                if (p != 0xFF) {
+                    --pending_by_parity[p];
+                }
                 submit_cv.notify_all();
             }
         }
@@ -714,6 +781,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
+                        static const bool log_readbacks = std::getenv("SHAD_LOG_READBACKS") != nullptr;
+                        if (log_readbacks) {
+                            LOG_INFO(Render, "GDSFINISH eos gds_store");
+                        }
                         rasterizer->Finish();
                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
                         *event_eos->Address() = value;
@@ -751,6 +822,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 } else if (dma_data->src_sel == DmaDataSrc::Data &&
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                    // Local change (SHAD_CP_LABEL_WRITES=1): a tiny constant fill to memory is a
+                    // label/fence write. Doing it on the GPU marks the page GPU-modified, so the
+                    // very next WaitRegMem/CPU poll of the label faults and drains the whole GPU
+                    // (precise readbacks). Write it from the CP like WriteData/EOP fences instead.
+                    static const bool cp_label_writes = std::getenv("SHAD_CP_LABEL_WRITES") != nullptr;
+                    if (cp_label_writes && dma_data->NumBytes() <= 16) {
+                        rasterizer->OnFence();
+                        u32* dst = dma_data->DstAddress<u32*>();
+                        for (u32 i = 0; i < dma_data->NumBytes() / sizeof(u32); ++i) {
+                            dst[i] = dma_data->data;
+                        }
+                        break;
+                    }
                     rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
                                            dma_data->data, false);
                 } else if (dma_data->src_sel == DmaDataSrc::Gds &&
@@ -780,7 +864,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     if (rasterizer) {
                         rasterizer->OnFence();
                     }
-                    std::memcpy(address, write_data->data, data_size);
+                    if (vo_port && vo_port->IsVoLabel(address)) {
+                        // Flip label writes race with VideoOutDriver::Flip(), which resets the
+                        // previously displayed buffer's label from the present thread. Serialize
+                        // through vo_mutex (upstream PR #5039).
+                        std::scoped_lock lock{vo_port->vo_mutex};
+                        std::memcpy(address, write_data->data, data_size);
+                        vo_port->vo_cv.notify_one();
+                    } else if (!WriteLabelNoFault(rasterizer, address, write_data->data,
+                                                  data_size)) {
+                        std::memcpy(address, write_data->data, data_size);
+                    }
                 } else {
                     UNREACHABLE();
                 }
@@ -835,8 +929,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
+                // Local change: poll the label through the unprotected backing alias. Reading
+                // it through the guest mapping faults whenever the 4K page was GPU-modified
+                // (precise readbacks), and each fault drains the whole GPU: ~14k drains per
+                // FIFA match. Labels are written by the CP (fences/WriteData), so the backing
+                // bytes are current; every 4096th spin still reads through the guest mapping so
+                // a label that really is written by the GPU resolves too. SHAD_NO_BACKING_POLL=1
+                // restores the old behaviour.
+                {
+                    const u32* backing = BackingLabel(wait_reg_mem);
+                    u32 spins = 0;
+                    while (!(backing && (++spins & 0xFFF) != 0
+                                 ? wait_reg_mem->TestValue(*static_cast<const volatile u32*>(backing))
+                                 : wait_reg_mem->Test(regs.reg_array))) {
+                        YIELD_GFX();
+                    }
                 }
                 break;
             }
@@ -1141,8 +1248,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_ASC(vqid);
+            {
+                const u32* backing = BackingLabel(wait_reg_mem);
+                u32 spins = 0;
+                while (!(backing && (++spins & 0xFFF) != 0
+                             ? wait_reg_mem->TestValue(*static_cast<const volatile u32*>(backing))
+                             : wait_reg_mem->Test(regs.reg_array))) {
+                    YIELD_ASC(vqid);
+                }
             }
             break;
         }
@@ -1192,32 +1305,33 @@ void Liverpool::HandleGetLodStats(const PM4CmdGetLodStats* get_lod) {
 
 Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
-    ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
+    const u32 p = OverlapSubmits() ? copy_parity : 0;
+    auto& dcb_buffer = queue.dcb_buffer[p];
+    auto& ccb_buffer = queue.ccb_buffer[p];
+    auto& dcb_offset = queue.dcb_buffer_offset[p];
+    auto& ccb_offset = queue.ccb_buffer_offset[p];
+    ASSERT_MSG(dcb_buffer.capacity() >= dcb_offset + dcb.size(),
                "dcb copy buffer out of reserved space");
-    ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
+    ASSERT_MSG(ccb_buffer.capacity() >= ccb_offset + ccb.size(),
                "ccb copy buffer out of reserved space");
 
-    queue.dcb_buffer.resize(
-        std::max(queue.dcb_buffer.size(), queue.dcb_buffer_offset + dcb.size()));
-    queue.ccb_buffer.resize(
-        std::max(queue.ccb_buffer.size(), queue.ccb_buffer_offset + ccb.size()));
+    dcb_buffer.resize(std::max(dcb_buffer.size(), dcb_offset + dcb.size()));
+    ccb_buffer.resize(std::max(ccb_buffer.size(), ccb_offset + ccb.size()));
 
-    const u32 prev_dcb_buffer_offset = queue.dcb_buffer_offset;
-    const u32 prev_ccb_buffer_offset = queue.ccb_buffer_offset;
+    const u32 prev_dcb_buffer_offset = dcb_offset;
+    const u32 prev_ccb_buffer_offset = ccb_offset;
     if (!dcb.empty()) {
-        std::memcpy(queue.dcb_buffer.data() + queue.dcb_buffer_offset, dcb.data(),
-                    dcb.size_bytes());
-        queue.dcb_buffer_offset += dcb.size();
-        dcb = std::span<const u32>{queue.dcb_buffer.begin() + prev_dcb_buffer_offset,
-                                   queue.dcb_buffer.begin() + queue.dcb_buffer_offset};
+        std::memcpy(dcb_buffer.data() + dcb_offset, dcb.data(), dcb.size_bytes());
+        dcb_offset += dcb.size();
+        dcb = std::span<const u32>{dcb_buffer.begin() + prev_dcb_buffer_offset,
+                                   dcb_buffer.begin() + dcb_offset};
     }
 
     if (!ccb.empty()) {
-        std::memcpy(queue.ccb_buffer.data() + queue.ccb_buffer_offset, ccb.data(),
-                    ccb.size_bytes());
-        queue.ccb_buffer_offset += ccb.size();
-        ccb = std::span<const u32>{queue.ccb_buffer.begin() + prev_ccb_buffer_offset,
-                                   queue.ccb_buffer.begin() + queue.ccb_buffer_offset};
+        std::memcpy(ccb_buffer.data() + ccb_offset, ccb.data(), ccb.size_bytes());
+        ccb_offset += ccb.size();
+        ccb = std::span<const u32>{ccb_buffer.begin() + prev_ccb_buffer_offset,
+                                   ccb_buffer.begin() + ccb_offset};
     }
 
     return std::make_pair(dcb, ccb);
@@ -1226,18 +1340,24 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
+    static const bool force_copy = std::getenv("SHAD_COPY_GPU_BUFFERS") != nullptr;
+    if (EmulatorSettings.IsCopyGpuBuffers() || force_copy) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
     auto task = ProcessGraphics(dcb);
     {
         std::scoped_lock lock{submit_mutex, queue.m_access};
+        const u8 p = static_cast<u8>(OverlapSubmits() ? copy_parity : 0);
         if (!ccb.empty()) {
             ce_submits.emplace(ProcessCeUpdate(ccb).handle);
+            ce_parity.push(p);
+            ++pending_by_parity[p];
             ++num_submits;
         }
         queue.submits.emplace(task.handle);
+        queue.submit_parity.push(p);
+        ++pending_by_parity[p];
         ++num_submits;
         submit_cv.notify_one();
     }
@@ -1252,6 +1372,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.submit_parity.push(0xFF); // no copy buffer involved
     }
 
     std::scoped_lock lk{submit_mutex};

@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -65,6 +66,16 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     range.base.layer = std::min<u32>(image.base_array, image.NumLayers() - 1);
     range.extent.levels = image.NumViewLevels(desc.is_array);
     range.extent.layers = image.NumViewLayers(desc.is_array);
+    {
+        // Diagnostic experiment (local, must match ImageInfo): SHAD_HUD_MIP0=1 limits tiled,
+        // non-block images whose pitch differs from their width to a single mip level.
+        static const bool hud_mip0 = std::getenv("SHAD_HUD_MIP0") != nullptr;
+        if (hud_mip0 && image.IsTiled() && !AmdGpu::IsBlockCoded(dfmt) &&
+            image.NumLevels() > 1 && image.Pitch() != image.width + 1) {
+            range.base.level = 0;
+            range.extent.levels = 1;
+        }
+    }
     type = image.GetViewType(desc.is_array);
     min_lod = static_cast<u32>(image.min_lod);
     if (!is_storage) {

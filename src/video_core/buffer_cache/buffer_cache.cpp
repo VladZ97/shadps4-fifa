@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -22,6 +23,17 @@
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
+
+// Local diagnostic: SHAD_WATCH_PAGE=<hex page addr> logs every GPU-modified marking that
+// touches that 4K page (who keeps a polled label page GPU-dirty).
+static bool WatchPageHit(VAddr addr, size_t size) {
+    static const VAddr watch = [] {
+        const char* v = std::getenv("SHAD_WATCH_PAGE");
+        return v ? static_cast<VAddr>(std::strtoull(v, nullptr, 16)) & ~VAddr(0xFFF) : VAddr(0);
+    }();
+    return watch != 0 && addr < watch + 0x1000 && addr + size > watch;
+}
+
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
@@ -158,6 +170,33 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
+void BufferCache::DownloadSmallAsync(VAddr addr, u64 size) {
+    const VAddr page = addr & ~VAddr(0xFFF);
+    const VAddr end = Common::AlignUp(addr + size, 0x1000);
+    const u32 first_block = page >> block_shift;
+    const u32 last_block = (end - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    DownloadMemory(arena, page, end - page, true);
+    const u64 tick = scheduler.CurrentTick();
+    for (VAddr p = page; p < end; p += 0x1000) {
+        async_page_ticks[p] = tick;
+    }
+    // Close the tick right here so a CPU poll that arrives early waits only for the work up to
+    // this download, not for whatever the command processor records afterwards.
+    static const bool no_flush = std::getenv("SHAD_NO_LABEL_FLUSH") != nullptr;
+    if (!no_flush) {
+        scheduler.Flush();
+    }
+    // Experiment (SHAD_TINY_STALE=1): let the CPU read the previous value of these tiny
+    // shader-written counters without faulting; the queued download refreshes the backing
+    // bytes as soon as the GPU is done. Keeps the game's render thread from stalling on a
+    // same-frame occlusion result (lens flare) at the cost of a one-frame-old value.
+    static const bool tiny_stale = std::getenv("SHAD_NO_TINY_STALE") == nullptr; // default on
+    if (tiny_stale) {
+        memory_tracker->UnmarkRegionAsGpuModified(page, end - page, false);
+    }
+}
+
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
@@ -180,6 +219,28 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
+        // Local change: the bytes may already be in flight in an asynchronous download
+        // (DownloadSmallAsync). A synchronous request must then wait for it to land before the
+        // pages can be unprotected, otherwise the faulting read would spin forever.
+        if (!async && memory_tracker->IsRegionGpuModified(device_addr, size)) {
+            // Wait only for the tick that carries the pending download, not for everything the
+            // command processor has recorded since (it runs ahead of the GPU).
+            u64 tick = 0;
+            bool found = false;
+            for (VAddr p = device_addr & ~VAddr(0xFFF); p < device_addr + size; p += 0x1000) {
+                if (const auto it = async_page_ticks.find(p); it != async_page_ticks.end()) {
+                    tick = std::max(tick, it->second);
+                    found = true;
+                }
+            }
+            if (found) {
+                scheduler.Wait(tick);
+            } else {
+                scheduler.Finish();
+            }
+            scheduler.PopPendingOperations();
+            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+        }
         return;
     }
     const auto download =
@@ -217,6 +278,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const bool is_written = True(flags & ObtainBufferFlags::IsWritten);
     const bool is_texel_buffer = True(flags & ObtainBufferFlags::IsTexelBuffer);
     const bool skip_stream_buffer = True(flags & ObtainBufferFlags::IgnoreStreamBuffer);
+    if (is_written && WatchPageHit(device_addr, size)) {
+        LOG_INFO(Render, "WATCH obtain-written addr={:#x} size={} texel={}", device_addr, size,
+                 is_texel_buffer);
+    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && !skip_stream_buffer && size <= STREAM_THRESHOLD &&
         !IsRegionGpuModified(device_addr, size)) {
@@ -259,9 +324,16 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
+    if (WatchPageHit(addr, size)) {
+        LOG_INFO(Render, "WATCH gpu-modified addr={:#x} size={}", addr, size);
+    }
     texture_cache.MarkAsMaybeGpuDirty(addr, size);
     memory_tracker->MarkRegionAsGpuModified(addr, size);
     gpu_modified_ranges.Add(addr, size);
+}
+
+void BufferCache::MarkRegionForCpuReadback(VAddr addr, size_t size) {
+    memory_tracker->MarkRegionAsGpuModified(addr, size);
 }
 
 void BufferCache::ReadEdgeImagePages(const Image& image) {

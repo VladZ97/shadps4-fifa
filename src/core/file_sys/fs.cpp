@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <unordered_map>
 #include <array>
 #include <unordered_set>
 #include "common/assert.h"
@@ -11,6 +12,7 @@
 #include "core/file_sys/backends/zarchive_fs.h"
 #include "core/file_sys/devices/logger.h"
 #include "core/file_sys/devices/nop_device.h"
+#include "core/file_sys/dir_index.h"
 #include "core/file_sys/fs.h"
 
 namespace Core::FileSys {
@@ -228,8 +230,20 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
     std::filesystem::path host_path = mount->host_path;
 
     // Update folder is either mount + "-UPDATE" or mount + "-patch"
+    // Local change: overlay roots do not change while running; memoize their existence.
+    static std::mutex overlay_mutex;
+    static std::unordered_map<std::string, bool> overlay_exists;
+    const auto root_exists = [&](const std::filesystem::path& p) {
+        std::scoped_lock lk{overlay_mutex};
+        const auto key = p.string();
+        if (const auto it = overlay_exists.find(key); it != overlay_exists.end()) {
+            return it->second;
+        }
+        std::error_code ec;
+        return overlay_exists.emplace(key, std::filesystem::exists(p, ec)).first->second;
+    };
     std::filesystem::path patch_path = OverlayPath(mount->host_path, "-UPDATE");
-    if (!std::filesystem::exists(patch_path)) {
+    if (!root_exists(patch_path)) {
         patch_path = OverlayPath(mount->host_path, "-patch");
     }
 
@@ -276,82 +290,59 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
         return host_path;
     }
 
-    const auto search = [&](const auto host_path) {
-        // If the path does not exist attempt to verify this.
-        // Retrieve parent path until we find one that exists.
-        std::scoped_lock lk{m_mutex};
-        path_parts.clear();
-        auto current_path = host_path;
-        std::error_code ec;
-        while (!current_path.empty() && !std::filesystem::exists(current_path, ec)) {
-            if (ec) {
-                LOG_ERROR(Kernel_Fs, "fs::exists returned {}", ec.message());
-                current_path = "";
-                break;
-            }
-            // We have probably cached this if it's a folder.
-            if (auto it = path_cache.find(current_path); it != path_cache.end()) {
-                current_path = it->second;
-                break;
-            }
-            path_parts.emplace_back(current_path.filename());
-            current_path = current_path.parent_path();
+    // Local change: resolve the relative path component by component through the directory
+    // index (one cached listing per directory) instead of stat() + directory scans per lookup.
+    const auto search = [&](const std::filesystem::path& root) -> std::optional<std::filesystem::path> {
+        std::filesystem::path full = root;
+        if (!rel_path.empty()) {
+            full /= rel_path;
         }
-        if (!current_path.empty()) {
-            // We have found an anchor. Traverse parts we recoded and see if they
-            // exist in filesystem but in different case.
-            auto guest_path = current_path;
-            while (!path_parts.empty()) {
-                const auto part = path_parts.back();
-                const auto add_match = [&](const auto& host_part) {
-                    current_path /= host_part;
-                    guest_path /= part;
-                    path_cache[guest_path] = current_path;
-                    path_parts.pop_back();
-                };
-                // Can happen when the mismatch is in upper folder.
-                std::error_code ec;
-                if (std::filesystem::exists(current_path / part, ec)) {
-                    add_match(part);
+        {
+            std::scoped_lock lk{m_mutex};
+            if (auto it = path_cache.find(full); it != path_cache.end()) {
+                return it->second;
+            }
+        }
+        auto& index = DirIndex::Instance();
+        std::filesystem::path current = root;
+        if (!rel_path.empty()) {
+            for (const auto& part : std::filesystem::path{rel_path}) {
+                const auto part_str = part.string();
+                if (part_str.empty() || part_str == ".") {
                     continue;
-                } else if (ec) {
-                    LOG_ERROR(Kernel_Fs, "fs::exists returned {}", ec.message());
                 }
-                const auto part_low = Common::ToLower(part.string());
-                bool found_match = false;
-                for (const auto& path : std::filesystem::directory_iterator(current_path, ec)) {
-                    const auto candidate = path.path().filename();
-                    const auto filename = Common::ToLower(candidate.string());
-                    // Check if a filename matches in case insensitive manner.
-                    if (filename != part_low) {
-                        continue;
-                    }
-                    // We found a match, record the actual path in the cache.
-                    add_match(candidate);
-                    found_match = true;
-                    break;
+                const auto actual = index.Lookup(current, part_str);
+                if (!actual) {
+                    return std::nullopt;
                 }
-                if (!found_match) {
-                    return std::optional<std::filesystem::path>({});
-                }
+                current /= *actual;
+            }
+        } else {
+            std::error_code ec;
+            if (!std::filesystem::exists(current, ec)) {
+                return std::nullopt;
             }
         }
-        return std::optional<std::filesystem::path>(current_path);
+        std::scoped_lock lk{m_mutex};
+        path_cache[full] = current;
+        return current;
     };
 
     if ((corrected_path.starts_with("/app0") || corrected_path.starts_with("/hostapp")) &&
         path_type != HostPathType::Base) {
-        if (const auto path = search(mods_path)) {
+        if (const auto path = search(OverlayPath(mount->host_path, "-mods"))) {
             return *path;
         }
     }
 
     if (path_type != HostPathType::Base && !ignore_game_patches) {
-        if (const auto path = search(patch_path)) {
+        if (const auto path = search(root_exists(OverlayPath(mount->host_path, "-UPDATE"))
+                                         ? OverlayPath(mount->host_path, "-UPDATE")
+                                         : OverlayPath(mount->host_path, "-patch"))) {
             return *path;
         }
     }
-    if (const auto path = search(host_path)) {
+    if (const auto path = search(mount->host_path)) {
         return *path;
     }
 
