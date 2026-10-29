@@ -874,9 +874,22 @@ void TextureCache::DownloadImagesForCpuRead(VAddr addr, size_t size, bool for_wr
                 const auto& im = slot_images[id];
                 const bool touches = addr < im.info.guest_address + im.info.guest_size &&
                                      im.info.guest_address < addr + size;
-                if (!touches && modified) {
+                // an image the CPU has read before may be read again right after this write:
+                // keep the synchronous download for it (a stale read gave glowing players)
+                const bool cpu_reads_it = cpu_read_images.contains(im.info.guest_address);
+                if (!touches && modified && !cpu_reads_it) {
                     modified = false;            // not a sync download
                     async_ids.push_back(id);     // but an async one
+                    async_written_images.insert(im.info.guest_address);
+                }
+            }
+        } else {
+            for (const auto& [id, _] : ids) {
+                const VAddr a = slot_images[id].info.guest_address;
+                if (cpu_read_images.insert(a).second && async_written_images.contains(a)) {
+                    // first CPU read of an image that already took the async path: the read may
+                    // have seen a stale copy (this is the window the read-history rule cannot close)
+                    LOG_WARNING(Render_Vulkan, "ONDEMAND RACE-RISK first read after async write-back addr={:#x}", a);
                 }
             }
         }

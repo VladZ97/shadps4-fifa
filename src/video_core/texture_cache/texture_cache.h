@@ -422,6 +422,8 @@ private:
     absl::flat_hash_set<ImageId> download_images;
     absl::flat_hash_set<ImageId> ondemand_images; ///< tiled images awaiting a CPU read fault
     absl::flat_hash_map<VAddr, u32> ondemand_page_refs; ///< read-watcher refcount per page (relaxed mode)
+    absl::flat_hash_set<VAddr> cpu_read_images; ///< guest addresses of images the CPU has read back at least once
+    absl::flat_hash_set<VAddr> async_written_images; ///< took the async write-back path at least once
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
