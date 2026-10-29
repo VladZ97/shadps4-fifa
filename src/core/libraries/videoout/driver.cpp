@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/stutter_stats.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -234,6 +235,9 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    if (VideoCore::StutterStats::Enabled()) {
+        VideoCore::StutterStats::Get().OnFlip();
+    }
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 

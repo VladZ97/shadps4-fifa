@@ -121,7 +121,9 @@ public:
     void InvalidateMemory(VAddr addr, size_t size);
 
     /// Local change: download GPU-written images overlapping a region the CPU is reading now.
-    void DownloadImagesForCpuRead(VAddr addr, size_t size);
+    /// write_range: the exact bytes a CPU write touches; images outside it are downloaded
+    /// asynchronously (no GPU drain) since their bytes are not being overwritten.
+    void DownloadImagesForCpuRead(VAddr addr, size_t size, bool for_write = false);
     void QueueReadback(ImageId image_id, Image& image);
     void ForgetOndemandImage(ImageId image_id);
     void ProtectForCpuRead(VAddr addr, size_t size, bool protect);

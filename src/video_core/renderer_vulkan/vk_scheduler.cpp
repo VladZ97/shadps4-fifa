@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/stutter_stats.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -126,6 +127,7 @@ void Scheduler::Flush() {
 }
 
 void Scheduler::Finish() {
+    VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().finishes, VideoCore::StutterStats::Get().finish_us};
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};

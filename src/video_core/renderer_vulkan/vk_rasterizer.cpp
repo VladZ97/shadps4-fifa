@@ -6,6 +6,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/stutter_stats.h"
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -1607,10 +1608,25 @@ void Rasterizer::FlushDeferredForMemory(VAddr addr, u64 size, bool assume_locks)
 }
 
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
+    VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().faults, VideoCore::StutterStats::Get().fault_us};
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    // Local diagnostic: SHAD_LOG_READBACKS=1 also logs CPU write faults into GPU-modified pages
+    // (these trigger a synchronous download + GPU wait) with their duration.
+    static const bool log_writes = std::getenv("SHAD_LOG_READBACKS") != nullptr;
+    const bool gpu_mod = log_writes && buffer_cache.IsRegionGpuModified(addr, size);
+    const auto wf_t0 = log_writes ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    struct LogAtExit {
+        bool on; VAddr addr; u64 size; bool gpu_mod; bool gpu_thread; std::chrono::steady_clock::time_point t0;
+        ~LogAtExit() {
+            if (on) {
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+                LOG_INFO(Render, "WRITEFAULT addr={:#x} size={} gpu_modified={} gpu_thread={} us={}", addr, size, gpu_mod, gpu_thread, us);
+            }
+        }
+    } _wf{log_writes && gpu_mod, addr, size, gpu_mod, assume_locks, wf_t0};
     // Local change: a CPU write into a page of an image that still awaits its on-demand
     // readback must not discard that readback (the game writes next to / into composites it
     // later reads back: kit and face textures came out wrong). Download first, then invalidate.
@@ -1618,7 +1634,7 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     static const bool keep_pending = std::getenv("SHAD_DROP_PENDING_ON_WRITE") == nullptr;
     if (keep_pending) {
         const auto image_flush = [this, addr, size] {
-            texture_cache.DownloadImagesForCpuRead(addr, size);
+            texture_cache.DownloadImagesForCpuRead(addr, size, /*for_write=*/true);
         };
         if (assume_locks) {
             image_flush();
@@ -1632,6 +1648,7 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
+    VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().faults, VideoCore::StutterStats::Get().fault_us};
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;

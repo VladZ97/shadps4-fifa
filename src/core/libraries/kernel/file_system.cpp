@@ -21,6 +21,7 @@
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
 
+#include "video_core/stutter_stats.h"
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
@@ -172,6 +173,7 @@ static void NoteFailedOpen(std::chrono::steady_clock::time_point t0) {
 }
 
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
+    VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().file_opens, VideoCore::StutterStats::Get().file_open_us};
     const auto open_t0 = std::chrono::steady_clock::now();
     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
 

@@ -3,6 +3,7 @@
 
 #include <ranges>
 
+#include "video_core/stutter_stats.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -351,6 +352,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
+        VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().pipelines, VideoCore::StutterStats::Get().pipeline_us};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
@@ -380,6 +382,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
         ComputePipeline::SerializationSupport sdata{};
+        VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().pipelines, VideoCore::StutterStats::Get().pipeline_us};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);
@@ -642,6 +645,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.hw_stage, info.pgm_hash);
         module = CompileSPV(*patch, instance.GetDevice());
     } else {
+        VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().modules, VideoCore::StutterStats::Get().module_us};
         module = CompileSPV(spv, instance.GetDevice());
     }
 

@@ -7,6 +7,7 @@
 #include <limits>
 #include <xxhash.h>
 
+#include "video_core/stutter_stats.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -830,8 +831,9 @@ void TextureCache::ProtectForCpuRead(VAddr addr, size_t size, bool protect) {
     }
 }
 
-void TextureCache::DownloadImagesForCpuRead(VAddr addr, size_t size) {
+void TextureCache::DownloadImagesForCpuRead(VAddr addr, size_t size, bool for_write) {
     boost::container::small_vector<std::pair<ImageId, bool>, 4> ids;
+    boost::container::small_vector<ImageId, 4> async_ids;
     {
         std::unique_lock lk{download_images_mutex};
         if (ondemand_images.empty()) {
@@ -846,6 +848,19 @@ void TextureCache::DownloadImagesForCpuRead(VAddr addr, size_t size) {
                 ids.emplace_back(image_id, True(image.flags & ImageFlagBits::GpuModified));
             }
         });
+        // for a CPU write: images whose bytes the write does not touch can be written back
+        // asynchronously (the game writes a neighbour in the same page every frame)
+        if (for_write) {
+            for (auto& [id, modified] : ids) {
+                const auto& im = slot_images[id];
+                const bool touches = addr < im.info.guest_address + im.info.guest_size &&
+                                     im.info.guest_address < addr + size;
+                if (!touches && modified) {
+                    modified = false;            // not a sync download
+                    async_ids.push_back(id);     // but an async one
+                }
+            }
+        }
         for (const auto& [id, _] : ids) {
             ondemand_images.erase(id);
         }
@@ -861,6 +876,15 @@ void TextureCache::DownloadImagesForCpuRead(VAddr addr, size_t size) {
         if (modified) {
             DownloadImageMemory(id, DownloadMemoryFlags::Sync | DownloadMemoryFlags::DiscardBufferCache);
         }
+    }
+    for (const auto id : async_ids) {
+        static std::atomic<u64> n{0};
+        if ((++n % 500) == 0) {
+            LOG_INFO(Render_Vulkan, "ONDEMAND async write-back #{} (neighbour CPU write)", n.load());
+        }
+        DownloadImageMemory(id, DownloadMemoryFlags::DiscardBufferCache);
+    }
+    for (const auto& [id, _] : ids) {
         // Always lift the read protection of the whole image, so a page that the download
         // did not cover (e.g. mip tail) cannot fault forever.
         const auto& image = slot_images[id];
@@ -1012,6 +1036,8 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().uploads, VideoCore::StutterStats::Get().upload_us};
+    VideoCore::StutterStats::Get().upload_bytes += image.info.guest_size;
     static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
     if (log_images) {
         const auto& i = image.info;
@@ -1408,6 +1434,7 @@ void TextureCache::GarbageCollectSamplers() {
 }
 
 void TextureCache::RunGarbageCollector() {
+    VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().gc_runs, VideoCore::StutterStats::Get().gc_us};
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;
