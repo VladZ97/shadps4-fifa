@@ -92,6 +92,25 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         std::max<s64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       min_critical_floor));
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+    // Local change: SHAD_GC_MB=<trigger MB> raises the GC thresholds (unified memory Macs have
+    // far more than the heuristics assume; the per-frame GC was costing up to 33 ms a frame).
+    // Default on this platform: the Metal layer reports a ~2 GB budget on a 32 GB unified-memory
+    // machine, which kept the collector in its "pressured" mode every frame. Use 3/4.5/6 GB
+    // unless the reported budget is genuinely larger.
+    if (device_local_memory < static_cast<s64>(4_GB)) {
+        trigger_gc_memory = 3_GB;
+        pressure_gc_memory = 4_GB + 512_MB;
+        critical_gc_memory = 6_GB;
+    }
+    if (const char* e = std::getenv("SHAD_GC_MB")) {
+        const u64 mb = std::strtoull(e, nullptr, 10);
+        trigger_gc_memory = mb << 20;
+        pressure_gc_memory = (mb + mb / 2) << 20;
+        critical_gc_memory = (mb * 2) << 20;
+    }
+    LOG_INFO(Render_Vulkan, "Texture GC thresholds: trigger {} MB, pressure {} MB, critical {} MB (budget {} MB)",
+             trigger_gc_memory >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20,
+             static_cast<u64>(device_local_memory) >> 20);
 }
 
 TextureCache::~TextureCache() = default;
@@ -1036,8 +1055,22 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 }
 
 void TextureCache::RefreshImage(Image& image) {
-    VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().uploads, VideoCore::StutterStats::Get().upload_us};
-    VideoCore::StutterStats::Get().upload_bytes += image.info.guest_size;
+    // Local diagnostic: time this refresh; log slow ones (SHAD_STUTTER=1) with the image info.
+    struct SlowUploadLog {
+        const Image& image;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~SlowUploadLog() {
+            if (!VideoCore::StutterStats::Enabled()) {
+                return;
+            }
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            if (us > 3000) {
+                LOG_INFO(Render_Vulkan, "SLOWUPLOAD {:.1f} ms addr={:#x} {}x{} mips={} fmt={} tiled={} size={:#x}", us / 1000.0,
+                         image.info.guest_address, image.info.size.width, image.info.size.height, image.info.resources.levels,
+                         vk::to_string(image.info.pixel_format), static_cast<u32>(image.info.props.is_tiled), image.info.guest_size);
+            }
+        }
+    } _slow{image};
     static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
     if (log_images) {
         const auto& i = image.info;

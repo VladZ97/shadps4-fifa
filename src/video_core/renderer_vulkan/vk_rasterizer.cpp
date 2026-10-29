@@ -1616,6 +1616,14 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     // Local diagnostic: SHAD_LOG_READBACKS=1 also logs CPU write faults into GPU-modified pages
     // (these trigger a synchronous download + GPU wait) with their duration.
     static const bool log_writes = std::getenv("SHAD_LOG_READBACKS") != nullptr;
+    // SHAD_LOG_WRITEFAULTS=1: sample every 16th CPU write fault (any page) for a histogram
+    static const bool log_all_writes = std::getenv("SHAD_LOG_WRITEFAULTS") != nullptr;
+    if (log_all_writes) {
+        static std::atomic<u32> n{0};
+        if ((++n & 15) == 0) {
+            LOG_INFO(Render, "WFAULT addr={:#x} gpu_thread={}", addr, assume_locks);
+        }
+    }
     const bool gpu_mod = log_writes && buffer_cache.IsRegionGpuModified(addr, size);
     const auto wf_t0 = log_writes ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     struct LogAtExit {
@@ -1649,6 +1657,18 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().faults, VideoCore::StutterStats::Get().fault_us};
+    struct SlowReadLog {
+        VAddr addr; bool gpu_thread; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~SlowReadLog() {
+            if (!VideoCore::StutterStats::Enabled()) {
+                return;
+            }
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            if (us > 3000) {
+                LOG_INFO(Render, "SLOWREAD {:.1f} ms addr={:#x} gpu_thread={}", us / 1000.0, addr, gpu_thread);
+            }
+        }
+    } _slow{addr, assume_locks};
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
