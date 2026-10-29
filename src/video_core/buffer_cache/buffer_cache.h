@@ -100,6 +100,13 @@ public:
     void UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write = false);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
+    /// Local change (deferred compute): ranges written by not-yet-emitted dispatches; any
+    /// ObtainBuffer overlapping one sets *hit so the rasterizer can flush them first.
+    void SetDeferredWriteTracker(const std::vector<std::pair<VAddr, u64>>* ranges, bool* hit) {
+        deferred_ranges = ranges;
+        deferred_hit = hit;
+    }
+
     /// Local change: queue an asynchronous download of the GPU-modified bytes in the page(s)
     /// of a tiny GPU write (label/fence), so the page becomes CPU-readable without a drain.
     void DownloadSmallAsync(VAddr addr, u64 size);
@@ -167,6 +174,8 @@ private:
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
     std::unique_ptr<MemoryTracker> memory_tracker;
+    const std::vector<std::pair<VAddr, u64>>* deferred_ranges{};
+    bool* deferred_hit{};
     absl::flat_hash_map<VAddr, u64> async_page_ticks; ///< page -> tick of pending DownloadSmallAsync
 
     StreamBuffer stream_buffer;

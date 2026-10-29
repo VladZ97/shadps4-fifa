@@ -1,3 +1,4 @@
+#include <execinfo.h>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -274,6 +275,16 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
         if (!signals->DispatchAccessViolation(raw_context, info->si_addr)) {
             if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
                 return;
+            }
+            {
+                // Local diagnostic: raw backtrace (x86 return addresses, symbolicate with nm)
+                void* frames[32];
+                const int n = backtrace(frames, 32);
+                std::string bt;
+                for (int i = 0; i < n; ++i) {
+                    bt += fmt::format("{:#x} ", reinterpret_cast<uintptr_t>(frames[i]));
+                }
+                LOG_CRITICAL(Core, "CRASH-BT {}", bt);
             }
             UNREACHABLE_MSG("Unhandled access violation at code address {}: {} address {}",
                             fmt::ptr(code_address),

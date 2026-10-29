@@ -193,7 +193,13 @@ void BufferCache::DownloadSmallAsync(VAddr addr, u64 size) {
     // same-frame occlusion result (lens flare) at the cost of a one-frame-old value.
     static const bool tiny_stale = std::getenv("SHAD_NO_TINY_STALE") == nullptr; // default on
     if (tiny_stale) {
-        memory_tracker->UnmarkRegionAsGpuModified(page, end - page, false);
+        // page by page, and only pages still marked: two downloads of the same page in a row
+        // (deferred dispatches) must not untrack a watcher twice
+        for (VAddr p = page; p < end; p += 0x1000) {
+            if (memory_tracker->IsRegionGpuModified(p, 0x1000)) {
+                memory_tracker->UnmarkRegionAsGpuModified(p, 0x1000, false);
+            }
+        }
     }
 }
 
@@ -275,6 +281,14 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         ObtainBufferFlags flags) {
+    if (deferred_ranges && !deferred_ranges->empty()) {
+        for (const auto& [a, n] : *deferred_ranges) {
+            if (device_addr < a + n && a < device_addr + size) {
+                *deferred_hit = true;
+                break;
+            }
+        }
+    }
     const bool is_written = True(flags & ObtainBufferFlags::IsWritten);
     const bool is_texel_buffer = True(flags & ObtainBufferFlags::IsTexelBuffer);
     const bool skip_stream_buffer = True(flags & ObtainBufferFlags::IgnoreStreamBuffer);

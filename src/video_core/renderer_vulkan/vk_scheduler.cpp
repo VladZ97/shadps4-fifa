@@ -1,3 +1,4 @@
+#include <fmt/format.h>
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -6,6 +7,7 @@
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
@@ -81,14 +83,23 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     };
 
     CommandBuffer().beginRendering(rendering_info);
+    if (gpu_profiler) {
+        gpu_profiler->BeginSegment(CommandBuffer(),
+                                   fmt::format("RP {}x{} c{} {}", render_state.width,
+                                               render_state.height,
+                                               render_state.num_color_attachments,
+                                               db.has_depth ? "d" : "-"));
+    }
 }
 
 void Scheduler::EndRendering() {
-    if (!is_rendering) {
-        return;
+    if (is_rendering) {
+        is_rendering = false;
+        if (gpu_profiler) {
+            gpu_profiler->EndSegment(CommandBuffer());
+        }
+        CommandBuffer().endRendering();
     }
-    is_rendering = false;
-    CommandBuffer().endRendering();
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
@@ -150,6 +161,9 @@ void Scheduler::BeginSession() {
     };
     session.primary = command_pool.Commit();
     Check(session.primary.begin(begin_info));
+    if (gpu_profiler) {
+        gpu_profiler->OnNewCommandBuffer(session.primary);
+    }
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -179,6 +193,9 @@ void Scheduler::EndSession() {
     }
 
     EndRendering();
+    if (gpu_profiler) {
+        gpu_profiler->OnEndCommandBuffer(session.primary);
+    }
     Check(session.primary.end());
 }
 

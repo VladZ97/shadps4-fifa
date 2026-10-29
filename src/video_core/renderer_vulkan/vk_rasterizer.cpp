@@ -1,3 +1,5 @@
+#include <thread>
+#include <fmt/format.h>
 #include <execinfo.h>
 #include <atomic>
 #include <cstdlib>
@@ -16,6 +18,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -36,6 +39,36 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+
+// Local experiment helper: comma-separated list of 32-bit compute program hashes to skip.
+static bool SkipComputeProgram(u64 pgm_hash) {
+    static const std::vector<u64> skip = [] {
+        std::vector<u64> v;
+        if (const char* e = std::getenv("SHAD_SKIP_CS")) {
+            std::string s{e};
+            size_t pos = 0;
+            while (pos < s.size()) {
+                const size_t next = s.find(',', pos);
+                const std::string tok = s.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+                if (!tok.empty()) {
+                    v.push_back(std::strtoull(tok.c_str(), nullptr, 16));
+                }
+                if (next == std::string::npos) {
+                    break;
+                }
+                pos = next + 1;
+            }
+        }
+        return v;
+    }();
+    if (skip.empty()) {
+        return false;
+    }
+    const u64 low = pgm_hash & 0xFFFFFFFFull;
+    return std::find(skip.begin(), skip.end(), low) != skip.end() ||
+           std::find(skip.begin(), skip.end(), pgm_hash) != skip.end();
+}
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
@@ -49,6 +82,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+
+    if (GpuProfiler::Enabled()) {
+        gpu_profiler = std::make_unique<GpuProfiler>(instance, scheduler);
+        scheduler.SetGpuProfiler(gpu_profiler.get());
+    }
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -204,10 +242,29 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     const auto state = BeginRendering(pipeline);
+    if (gpu_profiler) {
+        {
+            // label with the program hashes used by the shader dump file names
+            const auto& key = pipeline->GetGraphicsKey();
+            std::remove_cvref_t<decltype(key.stage_hashes)> pgm{};
+            for (u32 i = 0; i < key.stage_hashes.size(); ++i) {
+                if (key.stage_hashes[i]) {
+                    pgm[i] = pipeline->GetStage(static_cast<Shader::SwStage>(i)).pgm_hash;
+                }
+            }
+            gpu_profiler->NoteDraw(pgm);
+        }
+    }
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
+    }
+
+    if (deferred_hit && !deferred_dispatches.empty()) {
+        scheduler.EndRendering();
+        FlushDeferredCompute();
+        scheduler.BeginRendering(state);
     }
 
     if (needs_barrier) {
@@ -216,6 +273,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
+    if (!deferred_dispatches.empty() && (deferred_hit || scheduler.WouldEndRendering(state))) {
+        scheduler.EndRendering();
+        FlushDeferredCompute();
+    }
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -290,7 +351,21 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
+    if (!deferred_dispatches.empty() && (deferred_hit || scheduler.WouldEndRendering(state))) {
+        scheduler.EndRendering();
+        FlushDeferredCompute();
+    }
     scheduler.BeginRendering(state);
+    if (gpu_profiler) {
+        const auto& key = pipeline->GetGraphicsKey();
+        std::remove_cvref_t<decltype(key.stage_hashes)> pgm{};
+        for (u32 q = 0; q < key.stage_hashes.size(); ++q) {
+            if (key.stage_hashes[q]) {
+                pgm[q] = pipeline->GetStage(static_cast<Shader::SwStage>(q)).pgm_hash;
+            }
+        }
+        gpu_profiler->NoteDraw(pgm);
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -336,8 +411,17 @@ void Rasterizer::DispatchDirect() {
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return;
     }
+    // Experiment: SHAD_SKIP_CS=hash,hash skips those compute programs (measurement only).
+    if (SkipComputeProgram(cs.pgm_hash)) {
+        return;
+    }
 
     if (!BindResources(pipeline)) {
+        return;
+    }
+
+    if (TryDeferCompute(pipeline, cs, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z)) {
+        ResetBindings(true);
         return;
     }
 
@@ -346,11 +430,18 @@ void Rasterizer::DispatchDirect() {
     }
 
     scheduler.EndRendering();
+    FlushDeferredCompute();
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    if (gpu_profiler) {
+        gpu_profiler->BeginSegment(cmdbuf, fmt::format("CS {:08x} {}x{}x{}", static_cast<u32>(cs.pgm_hash), cs_program.dim_x, cs_program.dim_y, cs_program.dim_z));
+    }
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    if (gpu_profiler) {
+        gpu_profiler->EndSegment(cmdbuf);
+    }
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -381,11 +472,18 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
 
     scheduler.EndRendering();
+    FlushDeferredCompute();
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    if (gpu_profiler) {
+        gpu_profiler->BeginSegment(cmdbuf, fmt::format("CSI {:08x}", static_cast<u32>(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash)));
+    }
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    if (gpu_profiler) {
+        gpu_profiler->EndSegment(cmdbuf);
+    }
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -393,6 +491,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 }
 
 u64 Rasterizer::Flush() {
+    if (!deferred_dispatches.empty()) {
+        scheduler.EndRendering();
+        FlushDeferredCompute();
+    }
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
@@ -400,10 +502,18 @@ u64 Rasterizer::Flush() {
 }
 
 void Rasterizer::Finish() {
+    if (!deferred_dispatches.empty()) {
+        scheduler.EndRendering();
+        FlushDeferredCompute();
+    }
     scheduler.Finish();
 }
 
 void Rasterizer::OnSubmit() {
+    if (!deferred_dispatches.empty()) {
+        scheduler.EndRendering();
+        FlushDeferredCompute();
+    }
     FlushTinyWritten();
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
@@ -412,6 +522,8 @@ void Rasterizer::OnSubmit() {
 }
 
 void Rasterizer::OnFence() {
+    // deferred dispatches are not flushed at fences: CPU reads of their results fault on the
+    // read-protected pages and flush them then (FlushDeferredForMemory)
     FlushTinyWritten();
     texture_cache.ProcessDownloadImages();
 }
@@ -429,6 +541,134 @@ void Rasterizer::NoteTinyWritten(VAddr addr, u64 size) {
     if (tiny_written.size() < 64) {
         tiny_written.emplace_back(addr, size);
     }
+}
+
+bool Rasterizer::TryDeferCompute(const ComputePipeline* pipeline, const Shader::Info& cs, u32 x,
+                                 u32 y, u32 z) {
+    static const bool enabled = std::getenv("SHAD_DEFER_CS") != nullptr;
+    if (!enabled || in_deferred_flush || !cs.images.empty()) {
+        return false;
+    }
+    static const bool trace = std::getenv("SHAD_DEFER_CS_TRACE") != nullptr;
+    if (trace) {
+        LOG_INFO(Render_Vulkan, "deferred compute: defer {:08x} {}x{}x{} writes={} bufinfos={} imginfos={} written_ranges={}",
+                 static_cast<u32>(cs.pgm_hash), x, y, z, set_writes.size(), buffer_infos.size(),
+                 image_infos.size(), current_bind_written.size());
+    }
+    if (trace) {
+        std::string bufs;
+        for (const auto& b : buffer_infos) {
+            bufs += fmt::format("[{:#x}+{:#x}:{:#x}]", reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(b.buffer)), b.offset, b.range);
+        }
+        LOG_INFO(Render_Vulkan, "deferred compute: at-defer {:08x} pipeline={:#x} {}", static_cast<u32>(cs.pgm_hash),
+                 reinterpret_cast<uintptr_t>(static_cast<VkPipeline>(pipeline->Handle())), bufs);
+    }
+    DeferredDispatch rec{};
+    rec.pipeline = pipeline;
+    rec.buffer_infos = buffer_infos;
+    rec.image_infos = image_infos;
+    rec.set_writes = set_writes;
+    // The info arrays have inline storage, so pointers into them do not survive moves of the
+    // record: remember indices now and re-point at emit time.
+    for (auto& w : rec.set_writes) {
+        int bi = -1, ii = -1;
+        if (w.pBufferInfo) {
+            bi = static_cast<int>(w.pBufferInfo - buffer_infos.data());
+        }
+        if (w.pImageInfo) {
+            ii = static_cast<int>(w.pImageInfo - image_infos.data());
+        }
+        rec.info_index.emplace_back(bi, ii);
+    }
+    rec.push_data = push_data;
+    rec.x = x;
+    rec.y = y;
+    rec.z = z;
+    rec.pgm_hash = cs.pgm_hash;
+    rec.tiny = std::move(tiny_written);
+    tiny_written.clear();
+    for (const auto& r : current_bind_written) {
+        deferred_written.push_back(r);
+    }
+    if (deferred_dispatches.empty()) {
+        buffer_cache.SetDeferredWriteTracker(&deferred_written, &deferred_hit);
+    }
+    deferred_dispatches.push_back(std::move(rec));
+    ++deferred_total;
+    return true;
+}
+
+void Rasterizer::FlushDeferredCompute() {
+    if (deferred_dispatches.empty() || in_deferred_flush) {
+        return;
+    }
+    if (std::this_thread::get_id() != GetGpuCommandProcessorThread()) {
+        LOG_WARNING(Render_Vulkan, "deferred compute: EndRendering off the GPU thread, {} pending",
+                    deferred_dispatches.size());
+        return;
+    }
+    static const bool trace = std::getenv("SHAD_DEFER_CS_TRACE") != nullptr;
+    in_deferred_flush = true;
+    if (trace) {
+        LOG_INFO(Render_Vulkan, "deferred compute: flush {} pending, rendering={}", deferred_dispatches.size(), scheduler.IsRendering());
+    }
+    runtime.FlushBarriers();
+    boost::container::small_vector<std::pair<VAddr, u64>, 8> tiny_all;
+    for (auto& rec : deferred_dispatches) {
+        // re-fetch every time: a submit may have happened (new command buffer)
+        const auto cmdbuf = scheduler.CommandBuffer();
+        if (trace) {
+            LOG_INFO(Render_Vulkan, "deferred compute: emit {:08x} {}x{}x{} writes={} bufinfos={} tiny={}",
+                     static_cast<u32>(rec.pgm_hash), rec.x, rec.y, rec.z, rec.set_writes.size(),
+                     rec.buffer_infos.size(), rec.tiny.size());
+        }
+        for (size_t i = 0; i < rec.set_writes.size(); ++i) {
+            const auto [bi, ii] = rec.info_index[i];
+            rec.set_writes[i].pBufferInfo = bi >= 0 ? rec.buffer_infos.data() + bi : nullptr;
+            rec.set_writes[i].pImageInfo = ii >= 0 ? rec.image_infos.data() + ii : nullptr;
+        }
+        if (trace) {
+            std::string bufs;
+            for (const auto& b : rec.buffer_infos) {
+                bufs += fmt::format("[{:#x}+{:#x}:{:#x}]", reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(b.buffer)), b.offset, b.range);
+            }
+            LOG_INFO(Render_Vulkan, "deferred compute: step bind {:08x} pipeline={:#x} writes={} {}",
+                     static_cast<u32>(rec.pgm_hash), reinterpret_cast<uintptr_t>(static_cast<VkPipeline>(rec.pipeline->Handle())),
+                     rec.set_writes.size(), bufs);
+        }
+        rec.pipeline->BindResources(rec.set_writes, rec.push_data);
+        if (trace) {
+            LOG_INFO(Render_Vulkan, "deferred compute: step pipeline");
+        }
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, rec.pipeline->Handle());
+        if (trace) {
+            LOG_INFO(Render_Vulkan, "deferred compute: step dispatch {}x{}x{}", rec.x, rec.y, rec.z);
+        }
+        // no profiler timestamps here: a fence can land while a blit encoder is active and
+        // the Metal layer crashes on a timestamp written outside render/compute encoders
+        cmdbuf.dispatch(rec.x, rec.y, rec.z);
+        DebugState.IncDispatch();
+        static std::atomic<u64> emitted{0};
+        if ((++emitted % 2000) == 0) {
+            LOG_INFO(Render_Vulkan, "deferred compute: emitted {} total, deferred {} total", emitted.load(),
+                     deferred_total.load());
+        }
+        for (const auto& t : rec.tiny) {
+            tiny_all.push_back(t);
+        }
+    }
+    deferred_dispatches.clear();
+    // the tiny-buffer downloads submit (Flush) - do them once, after all dispatches
+    if (!tiny_all.empty()) {
+        for (const auto& t : tiny_all) {
+            NoteTinyWritten(t.first, t.second);
+        }
+        FlushTinyWritten();
+    }
+    deferred_written.clear();
+    deferred_hit = false;
+    buffer_cache.SetDeferredWriteTracker(nullptr, nullptr);
+    in_deferred_flush = false;
 }
 
 void Rasterizer::FlushTinyWritten() {
@@ -451,6 +691,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     set_writes.clear();
     buffer_infos.clear();
     image_infos.clear();
+    current_bind_written.clear();
 
     bool uses_dma = false;
 
@@ -856,6 +1097,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 VideoCore::ObtainBufferFlags flags = {};
                 if (desc.is_written) {
                     flags |= VideoCore::ObtainBufferFlags::IsWritten;
+                    current_bind_written.emplace_back(vsharp.base_address, size);
                     // Local change: a tiny shader-written buffer is a counter/label the CPU
                     // polls (FIFA: 3 x 8 bytes per frame). Remember it and queue an async
                     // download at the next fence so the poll does not fault and drain the GPU.
@@ -942,6 +1184,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             image_id = texture_cache.FindImage(desc);
             auto* image = &texture_cache.GetImage(image_id);
+            // deferred compute: a texture aliasing memory a pending dispatch writes must see
+            // the dispatch first (the game reads compute results through images too)
+            if (!deferred_written.empty() &&
+                DeferredOverlaps(image->info.guest_address, image->info.guest_size)) {
+                deferred_hit = true;
+            }
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
                 // Redirect the access to the actual depth-stencil buffer.
@@ -1264,6 +1512,10 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         return buffer_cache.ObtainBuffer(address, num_bytes,
                                          VideoCore::ObtainBufferFlags::IsWritten);
     }();
+    if (deferred_hit && !deferred_dispatches.empty()) {
+        scheduler.EndRendering();
+        FlushDeferredCompute();
+    }
     runtime.FillBuffer(buffer, offset, num_bytes, value);
     if (!is_gds && num_bytes <= 64) {
         static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
@@ -1308,6 +1560,10 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         .dstOffset = dst_offset,
         .size = num_bytes,
     };
+    if (deferred_hit && !deferred_dispatches.empty()) {
+        scheduler.EndRendering();
+        FlushDeferredCompute();
+    }
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
     if (!dst_gds && num_bytes <= 64) {
         static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
@@ -1324,6 +1580,32 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
+bool Rasterizer::DeferredOverlaps(VAddr addr, u64 size) const {
+    for (const auto& [a, n] : deferred_written) {
+        if (addr < a + n && a < addr + size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Rasterizer::FlushDeferredForMemory(VAddr addr, u64 size, bool assume_locks) {
+    if (deferred_dispatches.empty()) {
+        return;
+    }
+    const auto do_flush = [this, addr, size] {
+        if (!deferred_dispatches.empty() && DeferredOverlaps(addr, size)) {
+            scheduler.EndRendering();
+            FlushDeferredCompute();
+        }
+    };
+    if (assume_locks) {
+        do_flush();
+    } else {
+        liverpool->SendCommand<true>(do_flush);
+    }
+}
+
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
@@ -1332,6 +1614,7 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     // Local change: a CPU write into a page of an image that still awaits its on-demand
     // readback must not discard that readback (the game writes next to / into composites it
     // later reads back: kit and face textures came out wrong). Download first, then invalidate.
+    FlushDeferredForMemory(addr, size, assume_locks);
     static const bool keep_pending = std::getenv("SHAD_DROP_PENDING_ON_WRITE") == nullptr;
     if (keep_pending) {
         const auto image_flush = [this, addr, size] {
@@ -1374,6 +1657,7 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
             }
         }
     }
+    FlushDeferredForMemory(addr, size, assume_locks);
     // Local change: GPU-written tiled images are downloaded on the first CPU read.
     const auto image_flush = [this, addr, size] { texture_cache.DownloadImagesForCpuRead(addr, size); };
     if (assume_locks) {

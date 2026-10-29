@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
+
 #include <boost/container/small_vector.hpp>
 
 #include "common/recursive_lock.h"
@@ -25,6 +28,8 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+
+class GpuProfiler;
 
 class Rasterizer {
 public:
@@ -78,6 +83,11 @@ public:
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void NoteTinyWritten(VAddr addr, u64 size);
+    void FlushDeferredCompute();
+    bool DeferredOverlaps(VAddr addr, u64 size) const;
+    void FlushDeferredForMemory(VAddr addr, u64 size, bool assume_locks);
+    bool TryDeferCompute(const ComputePipeline* pipeline, const Shader::Info& cs, u32 x, u32 y,
+                         u32 z);
     void FlushTinyWritten();
     bool IsRegionGpuModified(VAddr addr, u64 size) {
         return buffer_cache.IsRegionGpuModified(addr, size);
@@ -144,9 +154,29 @@ private:
 
     const Instance& instance;
     Scheduler& scheduler;
+    std::unique_ptr<GpuProfiler> gpu_profiler;
     Runtime& runtime;
     VideoCore::PageManager page_manager;
     boost::container::small_vector<std::pair<VAddr, u64>, 8> tiny_written;
+    // Local change: compute dispatches deferred to the end of the current render pass so a
+    // dispatch does not split the pass (Metal: store + reload of all attachments per split).
+    struct DeferredDispatch {
+        const ComputePipeline* pipeline;
+        boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+        boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+        Pipeline::DescriptorWrites set_writes;
+        std::vector<std::pair<int, int>> info_index; ///< per write: index into buffer_infos / image_infos
+        Shader::PushData push_data;
+        u32 x, y, z;
+        u64 pgm_hash;
+        boost::container::small_vector<std::pair<VAddr, u64>, 8> tiny;
+    };
+    std::vector<DeferredDispatch> deferred_dispatches;
+    std::vector<std::pair<VAddr, u64>> deferred_written;
+    std::vector<std::pair<VAddr, u64>> current_bind_written;
+    bool deferred_hit{false};
+    std::atomic<u64> deferred_total{0};
+    bool in_deferred_flush{false};
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
     AmdGpu::Liverpool* liverpool;

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -23,6 +25,7 @@ class VkCtxScope;
 namespace Vulkan {
 
 class Instance;
+class GpuProfiler;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -353,6 +356,27 @@ using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 class Scheduler {
 public:
     explicit Scheduler(const Instance& instance);
+
+    /// Local tool: optional GPU pass profiler (SHAD_GPU_PROFILE=1).
+    bool IsRendering() const {
+        return is_rendering;
+    }
+
+    /// Local change: true if BeginRendering(state) would close the current pass.
+    bool WouldEndRendering(const RenderState& state) const {
+        return is_rendering && !(render_state == state);
+    }
+
+    /// Local change: called at every EndRendering (also when no pass was open).
+    void SetRenderEndCallback(std::function<void()>&& f) {
+        on_render_end = std::move(f);
+    }
+    void SetGpuProfiler(GpuProfiler* p) {
+        gpu_profiler = p;
+    }
+    GpuProfiler* GetGpuProfiler() const {
+        return gpu_profiler;
+    }
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
@@ -456,6 +480,8 @@ private:
 
 private:
     const Instance& instance;
+    GpuProfiler* gpu_profiler{};
+    std::function<void()> on_render_end{};
     Semaphore work_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
