@@ -1352,6 +1352,20 @@ create_target_directory_groups(shadps4)
 target_link_libraries(shadps4 PRIVATE spdlog::spdlog)
 target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3 dr_flac)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis SDL3::SDL3 pugixml::pugixml)
+
+# fifa-hybrid: the bloodborne_mac_port GPU library (native Metal renderer) as an alternative
+# video core, selected at runtime with SHAD_BBGPU=1.
+option(ENABLE_BBGPU "Link the bbgpu Metal GPU library (fifa hybrid)" OFF)
+set(BBGPU_ROOT "" CACHE PATH "bloodborne_mac_port checkout with out/gpu/libbbgpu.dylib built")
+target_sources(shadps4 PRIVATE src/core/bbgpu_bridge.cpp src/core/bbgpu_bridge.h)
+if(ENABLE_BBGPU)
+    target_compile_definitions(shadps4 PRIVATE ENABLE_BBGPU=1)
+    target_include_directories(shadps4 PRIVATE ${BBGPU_ROOT}/gpu ${BBGPU_ROOT})
+    # Native GPU process (SHAD_BBGPU_SPLIT=1): spawns bbgpu-host and mirrors guest memory into it.
+    target_sources(shadps4 PRIVATE src/core/bbgpu_split/gpu_process.c src/core/bbgpu_split/gpu_process.h)
+    target_link_libraries(shadps4 PRIVATE ${BBGPU_ROOT}/out/gpu/libbbgpu.dylib)
+    target_link_options(shadps4 PRIVATE -Wl,-rpath,${BBGPU_ROOT}/out/gpu -Wl,-rpath,${BBGPU_ROOT}/deps/x86_64/lib)
+endif()
 target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
 target_link_libraries(shadps4 PRIVATE Freetype::Freetype)
 target_link_libraries(shadps4 PRIVATE libprotobuf)
