@@ -16,6 +16,17 @@
 #include "core/memory.h"
 #include "libraries/error_codes.h"
 
+#if defined(ENABLE_BBGPU) && defined(__APPLE__)
+#include <mutex>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include "common/logging/log.h"
+extern "C" {
+#include "core/bbgpu_split/gpu_process.h"
+#include "host/bbgpu_shared.h"
+}
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -830,7 +841,173 @@ struct AddressSpace::Impl {
 };
 #endif
 
+#if defined(ENABLE_BBGPU) && defined(__APPLE__)
+// fifa-hybrid: the guest memory mirror for the native GPU process (SHAD_BBGPU_SPLIT=1,
+// core/bbgpu_split/gpu_process.c). Direct and flexible memory both live in the shm backing, so
+// a view is (address, size, backing offset); the host maps the same pages at the same address.
+// Views outside the mirrored ranges, unaligned to the host's 16 KiB pages, or not backed by the
+// shm (exec, file, private) are not mirrored; what they replace is unmapped in the host.
+namespace {
+struct MirrorView {
+    u64 end;
+    u64 phys;
+    int prot;
+};
+std::mutex g_mirror_mutex;
+std::map<VAddr, MirrorView> g_views; // by start
+RuntimeMemoryMirror g_mirror = nullptr;
+mach_port_t g_pool_entry = MACH_PORT_NULL;
+u8* g_backing_base = nullptr;
+u64 g_skipped = 0;
+
+bool Mirrorable(VAddr addr, u64 size) {
+    return size != 0 && ((addr | size) % BBGPU_GUEST_PAGE) == 0 &&
+           bbgpu_guest_range_ok(addr, addr + size);
+}
+
+// Removes [addr, addr+size) from the table, keeping the outside parts; true if any was mapped.
+bool ViewsRemoveLocked(VAddr addr, u64 size) {
+    const VAddr end = addr + size;
+    bool any = false;
+    auto it = g_views.upper_bound(addr);
+    if (it != g_views.begin() && std::prev(it)->second.end > addr) {
+        --it;
+    }
+    while (it != g_views.end() && it->first < end) {
+        const VAddr start = it->first;
+        const MirrorView view = it->second;
+        it = g_views.erase(it);
+        any = true;
+        if (start < addr) {
+            g_views.emplace(start, MirrorView{addr, view.phys, view.prot});
+        }
+        if (view.end > end) {
+            it = g_views.emplace(end, MirrorView{view.end, view.phys + (end - start), view.prot}).first;
+            ++it;
+        }
+    }
+    return any;
+}
+
+void MirrorMap(VAddr addr, u64 size, u64 phys) {
+    std::scoped_lock lock{g_mirror_mutex};
+    ViewsRemoveLocked(addr, size);
+    if (!Mirrorable(addr, size) || phys % BBGPU_GUEST_PAGE) {
+        static u64 skipped_bytes = 0;
+        skipped_bytes += size;
+        if (g_skipped++ < 200) {
+            std::fprintf(stderr, "GPU split: view %#llx+%#llx (backing %#llx) not mirrored (%llu MiB so far)\n",
+                         (unsigned long long)addr, (unsigned long long)size, (unsigned long long)phys,
+                         (unsigned long long)(skipped_bytes >> 20));
+        }
+        return;
+    }
+    g_views.emplace(addr, MirrorView{addr + size, phys, 3});
+    if (g_mirror) {
+        g_mirror(RUNTIME_MIRROR_MAP, addr, size, phys, 3);
+    }
+}
+
+void MirrorUnmap(VAddr addr, u64 size) {
+    std::scoped_lock lock{g_mirror_mutex};
+    if (ViewsRemoveLocked(addr, size) && g_mirror) {
+        const VAddr start = Common::AlignDown(addr, BBGPU_GUEST_PAGE);
+        const VAddr end = Common::AlignUp(addr + size, BBGPU_GUEST_PAGE);
+        if (bbgpu_guest_range_ok(start, end)) {
+            g_mirror(RUNTIME_MIRROR_UNMAP, start, end - start, 0, 0);
+        }
+    }
+}
+
+void MirrorProtect(VAddr addr, u64 size, int prot) {
+    std::scoped_lock lock{g_mirror_mutex};
+    const VAddr end = addr + size;
+    std::vector<std::pair<VAddr, MirrorView>> pieces;
+    auto it = g_views.upper_bound(addr);
+    if (it != g_views.begin() && std::prev(it)->second.end > addr) {
+        --it;
+    }
+    for (; it != g_views.end() && it->first < end; ++it) {
+        const VAddr s = std::max<VAddr>(it->first, addr);
+        const VAddr e = std::min<VAddr>(it->second.end, end);
+        pieces.emplace_back(s, MirrorView{e, it->second.phys + (s - it->first), prot});
+    }
+    for (const auto& [s, view] : pieces) {
+        ViewsRemoveLocked(s, view.end - s);
+        g_views.emplace(s, view);
+        if (g_mirror && (s | view.end) % BBGPU_GUEST_PAGE == 0) {
+            g_mirror(RUNTIME_MIRROR_PROTECT, s, view.end - s, 0, prot);
+        }
+    }
+}
+} // namespace
+
+// The PS4 protection (GPU bits included) of GPU-visible mappings, from the bbgpu bridge: the host
+// classifies GPU memory by it (BbArenaRuns).
+void BbSplitMirrorProt(VAddr addr, u64 size, u32 prot) {
+    MirrorProtect(addr, size, static_cast<int>(prot));
+}
+
+extern "C" mach_port_t runtime_memory_pool_entry(void) {
+    return g_pool_entry;
+}
+extern "C" uint64_t runtime_memory_pool_entry_size(void) {
+    return BackingSize;
+}
+extern "C" int runtime_memory_create_pool(void) {
+    std::scoped_lock lock{g_mirror_mutex};
+    if (g_pool_entry != MACH_PORT_NULL) {
+        return 0;
+    }
+    memory_object_size_t size = BackingSize;
+    const kern_return_t kr = mach_make_memory_entry_64(
+        mach_task_self(), &size, reinterpret_cast<memory_object_offset_t>(g_backing_base),
+        VM_PROT_READ | VM_PROT_WRITE, &g_pool_entry, MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS || size < BackingSize) {
+        LOG_CRITICAL(Kernel_Vmm, "GPU split: no memory entry for the backing ({}, {:#x} bytes)",
+                     mach_error_string(kr), size);
+        g_pool_entry = MACH_PORT_NULL;
+        return -1;
+    }
+    return 0;
+}
+extern "C" void runtime_memory_set_mirror(RuntimeMemoryMirror mirror) {
+    std::scoped_lock lock{g_mirror_mutex};
+    g_mirror = mirror;
+    if (!mirror) {
+        return;
+    }
+    for (const auto& [start, view] : g_views) {
+        mirror(RUNTIME_MIRROR_MAP, start, view.end - start, view.phys, 3);
+        if (view.prot != 3) {
+            mirror(RUNTIME_MIRROR_PROTECT, start, view.end - start, 0, view.prot);
+        }
+    }
+    LOG_INFO(Kernel_Vmm, "GPU split: {} views replayed to the host, {} not mirrored so far",
+             g_views.size(), g_skipped);
+}
+extern "C" void runtime_memory_mirror_snapshot(unsigned rotate, uint64_t max_sample,
+                                               void (*emit)(const RuntimeMirrorSnapshot*)) {
+    (void)rotate;
+    (void)max_sample;
+    std::scoped_lock lock{g_mirror_mutex};
+    RuntimeMirrorSnapshot snapshot{};
+    for (const auto& [start, view] : g_views) {
+        ++snapshot.views;
+        snapshot.bytes += view.end - start;
+    }
+    emit(&snapshot);
+}
+extern "C" int runtime_memory_mirror_checksum(uintptr_t address, uint64_t size, uint64_t* checksum) {
+    *checksum = bbgpu_checksum(BBGPU_CHECKSUM_SEED, reinterpret_cast<const void*>(address), size);
+    return 1;
+}
+#endif
+
 AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {
+#if defined(ENABLE_BBGPU) && defined(__APPLE__)
+    g_backing_base = impl->backing_base;
+#endif
     backing_base = impl->backing_base;
     system_managed_base = impl->system_managed_base;
     system_managed_size = impl->system_managed_size;
@@ -858,7 +1035,17 @@ void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_e
     // canonical copy of the memory and rely on the JIT to map translated code as executable.
     constexpr auto prot = PAGE_READWRITE;
 #endif
+#if defined(ENABLE_BBGPU) && defined(__APPLE__)
+    void* const mapped = impl->Map(virtual_addr, phys_addr, size, prot);
+    if (phys_addr != -1 && !is_exec) {
+        MirrorMap(virtual_addr, size, phys_addr);
+    } else {
+        MirrorUnmap(virtual_addr, size);
+    }
+    return mapped;
+#else
     return impl->Map(virtual_addr, phys_addr, size, prot);
+#endif
 }
 
 void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, uintptr_t fd) {
@@ -866,6 +1053,9 @@ void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, 
     return impl->Map(virtual_addr, offset, size,
                      ToWindowsProt(std::bit_cast<Core::MemoryProt>(prot)), fd);
 #else
+#if defined(ENABLE_BBGPU) && defined(__APPLE__)
+    MirrorUnmap(virtual_addr, size);
+#endif
     return impl->Map(virtual_addr, offset, size, ToPosixProt(std::bit_cast<Core::MemoryProt>(prot)),
                      fd);
 #endif
@@ -879,6 +1069,9 @@ VAddr AddressSpace::Unmap(VAddr virtual_addr, u64* size) {
             backing_pages[base_page + (offset >> Traits::PAGE_BITS)] = nullptr;
         }
     }
+#if defined(ENABLE_BBGPU) && defined(__APPLE__)
+    MirrorUnmap(virtual_addr, *size);
+#endif
     return impl->Unmap(virtual_addr, size);
 }
 

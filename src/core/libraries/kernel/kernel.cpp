@@ -18,6 +18,7 @@
 #include "core/libraries/kernel/debug.h"
 #include "core/libraries/kernel/equeue.h"
 #include "core/libraries/kernel/file_system.h"
+#include "core/bbgpu_bridge.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/libraries/kernel/orbis_error.h"
@@ -484,7 +485,9 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     Libraries::Kernel::RegisterThreads(sym);
     Libraries::Kernel::RegisterKernelEventFlag(sym);
     Libraries::Kernel::RegisterMemory(sym);
-    Libraries::Kernel::RegisterEventQueue(sym);
+    if (!Core::BbGpu::Enabled()) { // fifa-hybrid: the GPU library's event queue
+        Libraries::Kernel::RegisterEventQueue(sym);
+    }
     Libraries::Kernel::RegisterProcess(sym);
     Libraries::Kernel::RegisterException(sym);
     Libraries::Kernel::RegisterAio(sym);

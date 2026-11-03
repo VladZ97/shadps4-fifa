@@ -28,6 +28,7 @@
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/keyboard/keyboard.h"
 #include "core/libraries/libc_internal/libc_internal.h"
+#include "core/bbgpu_bridge.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/mouse/mouse.h"
 #include "core/libraries/move/move.h"
@@ -111,6 +112,18 @@ static void RegisterAudio3d(Core::Loader::SymbolsResolver* sym) {
     }
 }
 
+// fifa-hybrid: with the bbgpu bridge the GPU library registers these two itself.
+static void RegisterGnmDriver(Core::Loader::SymbolsResolver* sym) {
+    if (!Core::BbGpu::Enabled()) {
+        Libraries::GnmDriver::RegisterLib(sym);
+    }
+}
+static void RegisterVideoOut(Core::Loader::SymbolsResolver* sym) {
+    if (!Core::BbGpu::Enabled()) {
+        Libraries::VideoOut::RegisterLib(sym);
+    }
+}
+
 void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_Kernel, "Initializing HLE libraries");
 
@@ -122,8 +135,8 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     {
         constexpr auto ModulesToLoad = std::to_array<Core::SysModules>({
             {"libkernel.sprx", Libraries::Kernel::RegisterLib},
-            {"libSceGnmDriver.sprx", Libraries::GnmDriver::RegisterLib},
-            {"libSceVideoOut.sprx", Libraries::VideoOut::RegisterLib},
+            {"libSceGnmDriver.sprx", RegisterGnmDriver},
+            {"libSceVideoOut.sprx", RegisterVideoOut},
             {"libSceUserService.sprx", Libraries::UserService::RegisterLib},
             {"libSceSystemService.sprx", Libraries::SystemService::RegisterLib},
             {"libScePad.sprx", Libraries::Pad::RegisterLib},
