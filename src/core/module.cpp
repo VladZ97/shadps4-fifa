@@ -105,6 +105,16 @@ s32 Module::Start(u64 args, const void* argp, void* param) {
     return reinterpret_cast<EntryFunc>(addr)(args, argp, param);
 }
 
+s32 Module::Stop(u64 args, const void* argp) {
+    if (dynamic_info.fini_virtual_addr == 0) {
+        LOG_WARNING(Core_Linker, "Module {} has no module_stop", name);
+        return 0;
+    }
+    LOG_INFO(Core_Linker, "Module stopped : {}", name);
+    const VAddr addr = dynamic_info.fini_virtual_addr + GetBaseAddress();
+    return reinterpret_cast<EntryFunc>(addr)(args, argp, nullptr);
+}
+
 void Module::LoadModuleToMemory(u32& max_tls_index) {
     static constexpr size_t BlockAlign = 0x1000;
     static constexpr u64 TrampolineSize = 8_MB;

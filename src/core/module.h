@@ -217,6 +217,8 @@ public:
     }
 
     s32 Start(u64 args, const void* argp, void* param);
+    s32 Stop(u64 args, const void* argp);  // runs module_stop (DT_FINI) if the module has one
+    bool retired{false};                   // unloaded by the game: never returned by FindByName
     void LoadModuleToMemory(u32& max_tls_index);
     void LoadDynamicInfo();
     void LoadSymbols();

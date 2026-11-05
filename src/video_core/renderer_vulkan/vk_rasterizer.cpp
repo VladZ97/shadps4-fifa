@@ -1,3 +1,6 @@
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <fmt/format.h>
 #include <execinfo.h>
@@ -238,6 +241,30 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
+    // rain-probe: SHAD_RESOLVE_LOG=1 prints FIFA 16's EQAA resolve constants once a second
+    // (b0[0..3] and the pre-exposure b1[4]) to compare with the Metal hybrid.
+    if (static const bool resolve_log = std::getenv("SHAD_RESOLVE_LOG") != nullptr; resolve_log) {
+        const auto& key = pipeline->GetGraphicsKey();
+        const u32 fs = u32(Shader::SwStage::Fragment);
+        if (key.stage_hashes[fs]) {
+            const auto& ps = pipeline->GetStage(Shader::SwStage::Fragment);
+            if ((ps.pgm_hash & 0xffffffffull) == 0x92176db0ull && ps.buffers.size() >= 2) {
+                static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last >= std::chrono::milliseconds(1000)) {
+                    last = now;
+                    const auto s0 = ps.buffers[0].GetSharp(ps);
+                    const auto s1 = ps.buffers[1].GetSharp(ps);
+                    if (s0.base_address && s1.base_address) {
+                        const u32* d0 = reinterpret_cast<const u32*>(s0.base_address);
+                        const float* d1 = reinterpret_cast<const float*>(s1.base_address);
+                        std::fprintf(stderr, "[RESOLVE] b0[0..3]=%u %u %u %#x b1[4]=%g b1=%#llx\n", d0[0], d0[1],
+                                     d0[2], d0[3], d1[4], (unsigned long long)s1.base_address);
+                    }
+                }
+            }
+        }
+    }
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
