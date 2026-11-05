@@ -101,7 +101,7 @@ void* PS4_SYSV_ABI sceKernelGetProcParam() {
 
 s32 PS4_SYSV_ABI sceKernelLoadStartModule(const char* moduleFileName, u64 args, const void* argp,
                                           u32 flags, const void* pOpt, s32* pRes) {
-    LOG_INFO(Lib_Kernel, "called filename = {}, args = {}", moduleFileName, args);
+    LOG_ERROR(Lib_Kernel, "sceKernelLoadStartModule {} (args {})", moduleFileName, args);  // error level: visible in play mode
     ASSERT(flags == 0);
 
     auto* linker = Common::Singleton<Core::Linker>::Instance();
@@ -136,9 +136,23 @@ s32 PS4_SYSV_ABI sceKernelLoadStartModule(const char* moduleFileName, u64 args, 
 
 s32 PS4_SYSV_ABI sceKernelStopUnloadModule(s32 handle, u64 args, const void* argp, u32 flags,
                                            const void* pOpt, s32* pRes) {
-    LOG_ERROR(Lib_Kernel, "(STUBBED) handle = {:#x}", handle);
+    // Local change (FIFA 16): the game unloads its career engine (FootballCompEngzf.prx) when a
+    // career is left and loads it again for the next one. Returning the still-loaded module on
+    // the second load hands the game stale static state (crash at 0xcdcdcdcd). Run module_stop,
+    // then retire the module so the next sceKernelLoadStartModule maps and starts a fresh copy
+    // (the old mapping is leaked on purpose; a real unmap is not worth the risk here).
+    auto* linker = Common::Singleton<Core::Linker>::Instance();
+    auto* module = linker->GetModule(handle);
+    if (module == nullptr || handle < 1) {
+        LOG_ERROR(Lib_Kernel, "sceKernelStopUnloadModule: unknown handle {:#x}", handle);
+        return ORBIS_KERNEL_ERROR_ESRCH;
+    }
+    const s32 ret = module->Stop(args, argp);
+    module->retired = true;
+    LOG_ERROR(Lib_Kernel, "sceKernelStopUnloadModule: {} stopped (ret {}) and retired, handle {:#x}",
+              module->name, ret, handle);
     if (pRes) {
-        *pRes = 0;
+        *pRes = ret;
     }
     return ORBIS_OK;
 }

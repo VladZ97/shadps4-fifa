@@ -1,3 +1,4 @@
+#include <fstream>
 #include <atomic>
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -10,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef _WIN32
 #include <sys/utime.h>
@@ -172,6 +174,44 @@ static void NoteFailedOpen(std::chrono::steady_clock::time_point t0) {
     }
 }
 
+
+// fifamod per-competition scoreboards. Rule derived from download0/scoreboards/teamleague.txt
+// (team -> league, written by `fifamod build` from the game database): a competition id that
+// is a league applies only when BOTH teams belong to it (two La Liga clubs in a friendly yes,
+// Barcelona vs Bayern no); an id with no league teams is a tournament and always applies.
+static bool FifaScoreboardRuleAllows(Core::FileSys::MntPoints* mnt, int comp, int home, int away) {
+    static std::mutex mutex;
+    static bool loaded = false;
+    static std::unordered_map<int, std::vector<int>> team_leagues;
+    static std::unordered_set<int> leagues;
+    std::lock_guard lock{mutex};
+    if (!loaded) {
+        loaded = true;
+        std::ifstream tf(mnt->GetHostPath("/download0/scoreboards/teamleague.txt"));
+        int team, league;
+        while (tf >> team >> league) {
+            team_leagues[team].push_back(league);
+            leagues.insert(league);
+        }
+        LOG_ERROR(Kernel_Fs, "Scoreboard: {} team-league rows, {} leagues", team_leagues.size(), leagues.size());
+    }
+    if (!leagues.contains(comp)) {
+        return true; // tournament
+    }
+    auto in_league = [&](int team) {
+        auto t = team_leagues.find(team);
+        return t != team_leagues.end() && std::find(t->second.begin(), t->second.end(), comp) != t->second.end();
+    };
+    const bool ok = home > 0 && away > 0 && in_league(home) && in_league(away);
+    static std::atomic<int> last_said{-1};
+    const int key = comp * 10 + (ok ? 1 : 0);
+    if (last_said.exchange(key) != key) {
+        LOG_ERROR(Kernel_Fs, "Scoreboard: league {}: home {} away {} -> {}", comp, home, away,
+                  ok ? "both in the league, use it" : "not both in the league, default");
+    }
+    return ok;
+}
+
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().file_opens, VideoCore::StutterStats::Get().file_open_us};
     const auto open_t0 = std::chrono::steady_clock::now();
@@ -226,6 +266,77 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
         std::replace(path.begin(), path.end(), '\\', '/');
         path = "/data/" + path;
         LOG_WARNING(Kernel_Fs, "Relative path {} redirected to {}", raw_path, path);
+    }
+    // Local change (fifamod): per-competition scoreboards. FIFA names the competition in the
+    // tournament dressing it loads with the match scene, e.g.
+    // /download0/data/sceneassets/tournament/specifictournament_<team>_<comp>_<n>.rx3, long
+    // before it opens the scoreboard overlays. Remember the id and, when an overlay file is
+    // opened, serve /download0/scoreboards/<comp>/<same path> if fifamod built one for it.
+    {
+        static std::atomic<int> fifa_competition{-1};
+        static std::atomic<int> fifa_home_team{0};
+        static std::atomic<int> fifa_away_team{0};
+        static std::atomic<bool> fifa_in_match{false};  // crests follow the scoreboard only in-match
+        std::string lower = path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        constexpr std::string_view kTournament = "/download0/data/sceneassets/tournament/specifictournament_";
+        if (lower.starts_with(kTournament)) {
+            // specifictournament_<team>_<comp>_<n>.rx3 -> second number
+            const auto rest = lower.substr(kTournament.size());
+            const auto us = rest.find('_');
+            if (us != std::string::npos) {
+                int comp = -1;
+                try { comp = std::stoi(rest.substr(us + 1)); } catch (...) {}
+                // The game cascades through fallbacks (team_comp_stadium, 0_comp_stadium,
+                // team_0_stadium, 0_0_0 ...); 0 means "no competition", keep the real one.
+                if (comp > 0) {
+                    fifa_in_match = true;  // a new match is loading
+                }
+                if (comp > 0 && comp != fifa_competition.load()) {
+                    fifa_competition = comp;
+                    // error level so the line shows with the play-mode log filter (*:error)
+                    LOG_ERROR(Kernel_Fs, "Scoreboard: competition {} (from {})", comp, raw_path);
+                }
+            }
+        } else if (lower.starts_with("/download0/data/ui/imgassets/crest/stadium/stadium_")) {
+            // stadium_<home>_<comp>_<stadium>_<away>.dds (cascades with zeros): remember both teams
+            const auto rest = lower.substr(std::string_view("/download0/data/ui/imgassets/crest/stadium/stadium_").size());
+            int nums[4] = {0, 0, 0, 0}; int k = 0; size_t pos = 0;
+            while (k < 4 && pos < rest.size()) {
+                size_t end = rest.find_first_not_of("0123456789", pos);
+                if (end == pos) break;
+                try { nums[k++] = std::stoi(rest.substr(pos, end - pos)); } catch (...) { break; }
+                if (end == std::string::npos || rest[end] != '_') break;
+                pos = end + 1;
+            }
+            if (k == 4) {
+                if (nums[0] > 0) fifa_home_team = nums[0];
+                if (nums[3] > 0) fifa_away_team = nums[3];
+            }
+        } else if (fifa_in_match.load() && lower.starts_with("/download0/data/ui/game/screens/") &&
+                   (lower.find("results") != std::string::npos || lower.find("selectteam") != std::string::npos ||
+                    lower.find("kickoffhub") != std::string::npos)) {
+            // post-match results / team select / kick-off hub: the match is over. Only the crest
+            // redirect stops here (menus get the coloured crests back); the scoreboard keeps its
+            // competition until the next match loads, so a false alarm (the hub component is also
+            // loaded at half time) can never swap the score bar mid-match.
+            LOG_ERROR(Kernel_Fs, "Scoreboard: match over ({}), crests back to default", raw_path);
+            fifa_in_match = false;
+        } else if (fifa_competition.load() >= 0 &&
+                   (lower.starts_with("/download0/data/ui/game/overlays/") ||
+                    lower.starts_with("/download0/data/ui/game/globalcomponents/overlaycomponents_") ||
+                    (fifa_in_match.load() && lower.starts_with("/download0/data/ui/imgassets/crest")))) {
+            const std::string alt = "/download0/scoreboards/" + std::to_string(fifa_competition.load()) +
+                                    path.substr(std::string_view("/download0").size());
+            if (mnt->Exists(alt) && FifaScoreboardRuleAllows(mnt, fifa_competition.load(),
+                                                                fifa_home_team.load(), fifa_away_team.load())) {
+                static std::atomic<int> announced{-1};
+                if (announced.exchange(fifa_competition.load()) != fifa_competition.load()) {
+                    LOG_ERROR(Kernel_Fs, "Scoreboard: serving scoreboards/{} overlays", fifa_competition.load());
+                }
+                path = alt;
+            }
+        }
     }
     u32 handle = h->CreateHandle();
     auto* file = h->GetFile(handle);

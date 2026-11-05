@@ -360,7 +360,12 @@ void GameControllers::TryOpenSDLControllers() {
 }
 u8 GameControllers::GetGamepadIndexFromJoystickId(SDL_JoystickID id) {
     auto g = SDL_GetGamepadFromID(id);
-    ASSERT(g != nullptr);
+    if (g == nullptr) {
+        // Event from a joystick SDL no longer knows as a gamepad (unplugged mid-event, virtual
+        // device from a remote-desktop tool, ...): report "no slot" instead of asserting.
+        LOG_WARNING(Input, "Gamepad event for unknown joystick id {}, ignored", id);
+        return 0xFF;
+    }
     for (int i = 0; i < 5; i++) {
         if (controllers[i]->m_sdl_gamepad == g) {
             return i;

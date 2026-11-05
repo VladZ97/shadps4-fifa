@@ -27,6 +27,7 @@
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
+#include "core/bbgpu_bridge.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
 
@@ -213,7 +214,7 @@ void WindowSDL::WaitEvent() {
         return;
     }
 
-    if (ImGui::Core::ProcessEvent(&event)) {
+    if (!Core::BbGpu::Enabled() && ImGui::Core::ProcessEvent(&event)) { // fifa-hybrid: no ImGui layer
         return;
     }
 
@@ -281,7 +282,9 @@ void WindowSDL::WaitEvent() {
         Overlay::ToggleSimpleFps();
         break;
     case SDL_EVENT_TOGGLE_FRIENDS:
-        ImGui::Friends::Toggle();
+        if (!Core::BbGpu::Enabled()) {
+            ImGui::Friends::Toggle();
+        }
         break;
     case SDL_EVENT_RELOAD_INPUTS:
         Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
@@ -367,7 +370,9 @@ void WindowSDL::ReleaseKeyboard() {
 
 void WindowSDL::OnResize() {
     SDL_GetWindowSizeInPixels(window, &width, &height);
-    ImGui::Core::OnResize();
+    if (!Core::BbGpu::Enabled()) {
+        ImGui::Core::OnResize();
+    }
 }
 
 Uint32 wheelOffCallback(void* og_event, Uint32 timer_id, Uint32 interval) {
@@ -411,8 +416,10 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
     // as it would break the entire touchpad handling
     // You can still bind other things to it though
     if (event->gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
-        controllers[controllers.GetGamepadIndexFromJoystickId(event->gbutton.which)]->Button(
-            OrbisPadButtonDataOffset::TouchPad, input_down);
+        const u8 idx = controllers.GetGamepadIndexFromJoystickId(event->gbutton.which);
+        if (idx < 5) {
+            controllers[idx]->Button(OrbisPadButtonDataOffset::TouchPad, input_down);
+        }
         return;
     }
 
@@ -440,10 +447,12 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
     case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
     case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
     case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
-        controllers[controllers.GetGamepadIndexFromJoystickId(event->gtouchpad.which)]
-            ->SetTouchpadState(event->gtouchpad.finger,
-                               event->type != SDL_EVENT_GAMEPAD_TOUCHPAD_UP, event->gtouchpad.x,
-                               event->gtouchpad.y);
+        gamepad = controllers.GetGamepadIndexFromJoystickId(event->gtouchpad.which);
+        if (gamepad < 5) {
+            controllers[gamepad]->SetTouchpadState(event->gtouchpad.finger,
+                                                   event->type != SDL_EVENT_GAMEPAD_TOUCHPAD_UP,
+                                                   event->gtouchpad.x, event->gtouchpad.y);
+        }
         return;
     default:
         break;

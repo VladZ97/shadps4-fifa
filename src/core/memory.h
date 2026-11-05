@@ -29,6 +29,10 @@ class MemoryMapViewer;
 namespace Core {
 
 constexpr u64 DEFAULT_MAPPING_BASE = 0x200000000;
+/// fifa-hybrid: SHAD_MAPPING_BASE=<hex> moves where non-fixed mappings are placed (and raises
+/// lower hints to it), so guest memory avoids the arm64 shared region (0x180000000-0x34fffffff)
+/// that a native GPU process cannot map over. Default: DEFAULT_MAPPING_BASE, hints unchanged.
+u64 MappingBase();
 constexpr u64 GUEST_PAGE_BITS = 14;
 constexpr u64 GUEST_PAGE_SIZE = 1ULL << GUEST_PAGE_BITS;
 
@@ -309,6 +313,11 @@ public:
     s32 GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats);
 
     void InvalidateMemory(VAddr addr, u64 size) const;
+
+    // fifa-hybrid: notifications to the GPU tracker (own rasterizer, or the bbgpu bridge).
+    void GpuRegister(VAddr addr, u64 size);
+    void GpuMap(VAddr addr, u64 size);
+    void GpuUnmap(VAddr addr, u64 size);
 
 private:
     VMAHandle FindVMA(VAddr target) {

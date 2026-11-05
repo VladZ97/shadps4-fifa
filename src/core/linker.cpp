@@ -23,6 +23,7 @@
 #include "core/libraries/libc_internal/libc_internal.h"
 #include "core/libraries/sysmodule/sysmodule.h"
 #include "core/libraries/sysmodule/sysmodule_internal.h"
+#include "core/bbgpu_bridge.h"
 #include "core/linker.h"
 #include "core/memory.h"
 #include "core/tls.h"
@@ -421,6 +422,17 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
         *return_info = *record;
         Core::Devtools::Widget::ModuleList::AddModule(sr.library);
         return true;
+    }
+
+    // fifa-hybrid: GnmDriver, VideoOut and the kernel event queue come from the GPU library.
+    if (BbGpu::Enabled() && sym_type == Loader::SymbolType::Function &&
+        (sr.library == "libSceGnmDriver" || sr.library == "libSceVideoOut" ||
+         sr.library == "libkernel")) {
+        if (const u64 address = BbGpu::Resolve(name)) {
+            return_info->symbol = sr;
+            return_info->virtual_address = address;
+            return true;
+        }
     }
 
     // Check if it an exported function from one of our loaded libraries

@@ -43,6 +43,7 @@
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/save_data/save_backup.h"
 #include "core/libraries/usbd/usbstorage.h"
+#include "core/bbgpu_bridge.h"
 #include "core/linker.h"
 #include "core/memory.h"
 #include "core/user_settings.h"
@@ -675,6 +676,15 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         Libraries::Kernel::g_environment[i] = env_vars[i].c_str();
     }
     Libraries::Kernel::g_environment[env_max] = nullptr;
+
+    // fifa-hybrid: the GPU library renders into this window's Metal layer.
+    if (Core::BbGpu::Enabled()) {
+        if (!Core::BbGpu::Init(*window, id, game_info.title, game_info.sdk_ver,
+                               game_info.psf_attributes.raw)) {
+            LOG_CRITICAL(Loader, "bbgpu bridge failed to start");
+            std::quick_exit(1);
+        }
+    }
 
     // Initialize kernel and library facilities.
     Libraries::InitHLELibs(&linker->GetHLESymbols());

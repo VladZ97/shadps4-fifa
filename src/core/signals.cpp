@@ -11,6 +11,7 @@
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/libraries/kernel/threads/pthread.h"
+#include "core/bbgpu_bridge.h"
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -272,7 +273,27 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     case SIGBUS: {
         const bool is_write = Common::IsWriteError(raw_context);
         const bool is_exec = Common::IsExecuteError(raw_context);
+        if (static const bool diag0 = std::getenv("SHAD_FAULT_DIAG") != nullptr; diag0) {
+            char line[160];
+            const int len = std::snprintf(line, sizeof line, "FAULT-IN sig %d addr %p rip %#llx w %d\n", sig,
+                                          info->si_addr, (unsigned long long)context.uc_mcontext.mc_rip,
+                                          int(is_write));
+            (void)!write(2, line, len);
+        }
+        if (Core::BbGpu::Enabled() && Core::BbGpu::HandleFault(raw_context, info->si_addr)) {
+            return;
+        }
         if (!signals->DispatchAccessViolation(raw_context, info->si_addr)) {
+            if (static const bool diag = std::getenv("SHAD_FAULT_DIAG") != nullptr; diag) {
+                // Synchronous: the logger thread may not get to print before the process ends.
+                char line[160];
+                const int len = std::snprintf(line, sizeof line, "FAULT-DIAG sig %d addr %p rip %#llx\n", sig,
+                                              info->si_addr,
+                                              (unsigned long long)context.uc_mcontext.mc_rip);
+                (void)!write(2, line, len);
+                void* frames[32];
+                backtrace_symbols_fd(frames, backtrace(frames, 32), 2);
+            }
             if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
                 return;
             }

@@ -90,7 +90,7 @@ public:
 
     u32 FindByName(const std::filesystem::path& name) const {
         for (u32 i = 0; i < m_modules.size(); i++) {
-            if (name == m_modules[i]->file) {
+            if (!m_modules[i]->retired && name == m_modules[i]->file) {
                 return i;
             }
         }
