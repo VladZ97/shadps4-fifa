@@ -86,9 +86,13 @@ static std::optional<std::filesystem::path> GetBundleParentDirectory() {
 #endif
 
 static auto UserPaths = [] {
-    // Try the portable user directory first.
+    // Local change (FIFA 16 launcher): SHAD_USER_DIR names the user directory explicitly so a
+    // self-contained app can keep config/cache/logs in its own Application Support folder.
     auto user_dir = std::filesystem::current_path() / PORTABLE_DIR;
-    if (!std::filesystem::exists(user_dir)) {
+    if (const char* env = getenv("SHAD_USER_DIR"); env && *env) {
+        user_dir = std::filesystem::path(env);
+        std::filesystem::create_directories(user_dir);
+    } else if (!std::filesystem::exists(user_dir)) {
         // If it doesn't exist, use the standard path for the platform instead.
         // NOTE: On Windows we currently just create the portable directory instead.
 #ifdef __APPLE__

@@ -619,11 +619,17 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     std::filesystem::create_directory(mount_temp_dir);
     mnt->Mount(mount_temp_dir, "/temp");
 
-    const auto& mount_download_dir =
+    // Local change (FIFA 16 launcher): SHAD_DOWNLOAD_DIR = the mods/patch overlay served as
+    // /download0 (the engine probes loose assets there before its archives).
+    std::filesystem::path mount_download_dir =
         Common::FS::GetUserPath(Common::FS::PathType::DownloadDir) / id;
-    if (!std::filesystem::exists(mount_download_dir)) {
-        std::filesystem::create_directory(mount_download_dir);
+    if (const char* env = getenv("SHAD_DOWNLOAD_DIR"); env && *env) {
+        mount_download_dir = std::filesystem::path(env);
     }
+    if (!std::filesystem::exists(mount_download_dir)) {
+        std::filesystem::create_directories(mount_download_dir);
+    }
+    LOG_INFO(Loader, "/download0 -> {}", Common::FS::PathToUTF8String(mount_download_dir));
     mnt->Mount(mount_download_dir, "/download0");
 
     const auto mount_usb_dir = Libraries::UsbStorage::GetUsbMountPath();

@@ -51,6 +51,17 @@ std::string RemoveTrailingSlashes(const std::string& path) {
 }
 
 std::filesystem::path OverlayPath(const std::filesystem::path& base, std::string_view suffix) {
+    // Local change (FIFA 16 launcher): explicit overlay folders instead of "<game>-UPDATE" /
+    // "<game>-mods" siblings. SHAD_UPDATE_DIR serves both -UPDATE and -patch probes.
+    if (suffix == "-UPDATE" || suffix == "-patch") {
+        if (const char* env = getenv("SHAD_UPDATE_DIR"); env && *env) {
+            return std::filesystem::path(env);
+        }
+    } else if (suffix == "-mods") {
+        if (const char* env = getenv("SHAD_MODS_DIR"); env && *env) {
+            return std::filesystem::path(env);
+        }
+    }
     std::filesystem::path result = base;
     if (result.extension() == ".zar") {
         result.replace_extension();

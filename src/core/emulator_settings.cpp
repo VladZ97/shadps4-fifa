@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
@@ -177,6 +178,13 @@ const std::vector<bool> EmulatorSettingsImpl::GetGameInstallDirsEnabled() {
 }
 
 std::filesystem::path EmulatorSettingsImpl::GetHomeDir() {
+    // Local change (FIFA 16 launcher): SHAD_HOME_DIR = the savegame root chosen in the launcher
+    // (saves land in <root>/<user id>/savedata/<title id>/).
+    if (const char* env = getenv("SHAD_HOME_DIR"); env && *env) {
+        std::filesystem::path home{env};
+        std::filesystem::create_directories(home);
+        return home;
+    }
     if (m_general.home_dir.value.empty()) {
         return Common::FS::GetUserPath(Common::FS::PathType::HomeDir);
     }
