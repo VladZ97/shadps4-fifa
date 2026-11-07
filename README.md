@@ -1,3 +1,10 @@
+> **This is a fork for one purpose**: running FIFA 16 (CUSA02138) on Apple Silicon Macs with a native
+> Metal renderer (branch `metal-hybrid`, see https://github.com/VladZ97/fifa16_mac_port). It is not
+> the shadPS4 project; do not ask the shadPS4 team for support with it, and do not report its bugs to
+> them. The upstream README follows unchanged. Changes to upstream files are listed in
+> `CHANGES-FIFA.md`. Licence: GPL-2.0-or-later, as upstream. Unofficial; no affiliation with
+> Electronic Arts, FIFA or Sony; no game files, keys or patch content are included.
+
 <!--
 SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project (fifa-hybrid fork, VladZ97)
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Local tool: per-render-pass / per-dispatch GPU timing with timestamp queries.
 // Enabled with SHAD_GPU_PROFILE=1; prints the heaviest segments every few seconds.
 #pragma once

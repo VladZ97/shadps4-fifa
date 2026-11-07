@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project (fifa-hybrid fork, VladZ97)
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Mark Hall
 /* Native arm64 GPU process (docs/DESIGN_NATIVE_GPU_PROCESS.md), runtime side: spawns
  * out/bbgpu-host, hands it the guest memory entry and the shared control block, mirrors every

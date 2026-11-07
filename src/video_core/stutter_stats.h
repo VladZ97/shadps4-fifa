@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project (fifa-hybrid fork, VladZ97)
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Local tool: frame-time spikes and what happened inside them (SHAD_STUTTER=1).
 #pragma once
 
