@@ -346,7 +346,13 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
         }
     }
 
-    if (path_type != HostPathType::Base && !ignore_game_patches) {
+    // Local change (FIFA 16 launcher): the update overlay belongs to the game mount only. With
+    // SHAD_UPDATE_DIR set, OverlayPath returns that folder for EVERY mount, so /savedata0/DATA
+    // was looked up in the update folder first, where its "data" directory matched (case-
+    // insensitive volumes): "Is a directory", no save ever written. Upstream never sees this
+    // because "<save dir>-UPDATE" does not exist.
+    if ((corrected_path.starts_with("/app0") || corrected_path.starts_with("/hostapp")) &&
+        path_type != HostPathType::Base && !ignore_game_patches) {
         if (const auto path = search(root_exists(OverlayPath(mount->host_path, "-UPDATE"))
                                          ? OverlayPath(mount->host_path, "-UPDATE")
                                          : OverlayPath(mount->host_path, "-patch"))) {

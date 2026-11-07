@@ -297,7 +297,10 @@ Users UserManager::CreateDefaultUsers() {
             std::filesystem::create_directory(user_dir / "trophy");
             std::filesystem::create_directory(user_dir / "inputs");
             if (u.user_id == 1000) {
-                TransferOption user_choice = AskMigrationOption();
+                // Local change (FIFA 16 launcher): no "Save Migration" prompt. The saves folder
+                // the launcher passes (SHAD_HOME_DIR) is the only save location; a new one starts
+                // empty. Upstream asks here on every first run, before even looking for old files.
+                TransferOption user_choice = TransferOption::Nothing;
                 CheckAndMigrateSaves(user_choice);
                 CheckAndMigrateTrophies(user_choice);
             }
