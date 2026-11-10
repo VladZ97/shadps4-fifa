@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef ENABLE_FDK_AAC // fifa-hybrid: the whole decoder is left out without the FDK AAC library
+
 #include "ajm.h"
 #include "ajm_aac.h"
 #include "ajm_result.h"
@@ -218,3 +220,5 @@ DecoderResult AjmAacDecoder::ProcessData(std::span<u8>& input, SparseOutputBuffe
 }
 
 } // namespace Libraries::Ajm
+
+#endif // ENABLE_FDK_AAC

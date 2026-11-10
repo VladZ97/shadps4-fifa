@@ -5,7 +5,7 @@ port. Dates are the commit dates; the full history is in git. Upstream: https://
 
 | status | file | last changed |
 |---|---|---|
-| M | `CMakeLists.txt` | 2026-11-03 |
+| M | `CMakeLists.txt` | 2026-11-10 |
 | M | `src/common/path_util.cpp` | 2026-11-06 |
 | M | `src/core/address_space.cpp` | 2026-11-03 |
 | A | `src/core/bbgpu_bridge.cpp` | 2026-11-10 |
@@ -70,3 +70,18 @@ port. Dates are the commit dates; the full history is in git. Upstream: https://
 | M | `src/core/cpu_patches.cpp` | 2026-11-10 |
 | M | `src/core/loader/symbols_resolver.cpp` | 2026-11-10 |
 | M | `src/core/loader/symbols_resolver.h` | 2026-11-10 |
+| M | `externals/CMakeLists.txt` | 2026-11-10 |
+| M | `src/core/libraries/ajm/ajm_aac.cpp` | 2026-11-10 |
+| M | `src/core/libraries/ajm/ajm_context.cpp` | 2026-11-10 |
+| M | `src/core/libraries/ajm/ajm_instance.cpp` | 2026-11-10 |
+| M | `src/core/net/p2p_crypto.cpp` | 2026-11-10 |
+
+## Libraries left out
+
+`ENABLE_GPL_INCOMPATIBLE_LIBS` (default OFF in this fork) controls two libraries of upstream shadPS4
+whose licences are not compatible with the GPL: the Fraunhofer FDK AAC decoder and LibreSSL (which
+carries the OpenSSL and SSLeay licences). The binaries of this fork are redistributed, so they are
+built without both: creating an AAC decoder instance returns `ORBIS_AJM_ERROR_CODEC_NOT_SUPPORTED`
+(FIFA 16 registers the codec but never creates an instance), libSceHttp HTTPS falls back to upstream's
+mock path, and the P2P packet protection (AES-128-CFB, HMAC-SHA1) uses the system's CommonCrypto.
+Set the option to ON for a private build with upstream's behaviour.

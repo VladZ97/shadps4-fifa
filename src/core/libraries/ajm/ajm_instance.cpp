@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef ENABLE_FDK_AAC
 #include "ajm_aac.h"
+#endif
 #include "ajm_at9.h"
 #include "ajm_instance.h"
 #include "ajm_mp3.h"
@@ -36,11 +38,13 @@ AjmInstance::AjmInstance(AjmCodecType codec_type, AjmInstanceFlags flags) : m_fl
             AjmFormatEncoding(flags.format), AjmMp3CodecFlags(flags.codec), u32(flags.channels));
         break;
     }
+#ifdef ENABLE_FDK_AAC
     case AjmCodecType::M4aacDec: {
         m_codec = std::make_unique<AjmAacDecoder>(
             AjmFormatEncoding(flags.format), AjmAacCodecFlags(flags.codec), u32(flags.channels));
         break;
     }
+#endif
     default:
         UNREACHABLE_MSG("Unimplemented codec type {}", magic_enum::enum_name(codec_type));
     }

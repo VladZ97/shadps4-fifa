@@ -39,6 +39,11 @@ cmake_dependent_option(ENABLE_SYSTEM_VULKAN "Enable the system Vulkan driver" OF
 option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
+# fifa-hybrid: the FDK AAC licence and the OpenSSL/SSLeay licences inside LibreSSL are not GPL-compatible,
+# so this fork, whose binaries are redistributed, leaves both libraries out by default: an AAC decoder
+# instance is refused (CODEC_NOT_SUPPORTED), libSceHttp HTTPS falls back to the mock and the P2P packet
+# crypto uses the system's CommonCrypto.
+option(ENABLE_GPL_INCOMPATIBLE_LIBS "Link FDK AAC and LibreSSL (not for binaries that are redistributed)" OFF)
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
 
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
@@ -1366,7 +1371,11 @@ if(ENABLE_BBGPU)
     target_link_libraries(shadps4 PRIVATE ${BBGPU_ROOT}/out/gpu/libbbgpu.dylib)
     target_link_options(shadps4 PRIVATE -Wl,-rpath,${BBGPU_ROOT}/out/gpu -Wl,-rpath,${BBGPU_ROOT}/deps/x86_64/lib)
 endif()
-target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
+target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
+if (ENABLE_GPL_INCOMPATIBLE_LIBS)
+    target_link_libraries(shadps4 PRIVATE fdk-aac)
+    target_compile_definitions(shadps4 PRIVATE ENABLE_FDK_AAC=1 ENABLE_LIBRESSL=1)
+endif()
 target_link_libraries(shadps4 PRIVATE Freetype::Freetype)
 target_link_libraries(shadps4 PRIVATE libprotobuf)
 target_link_libraries(shadps4 PRIVATE ZArchive::zarchive)

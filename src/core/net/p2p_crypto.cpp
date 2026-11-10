@@ -3,10 +3,19 @@
 
 #include <algorithm>
 
+#ifdef ENABLE_LIBRESSL
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+#else
+// fifa-hybrid: built without LibreSSL (the OpenSSL/SSLeay licences are not GPL-compatible); the same
+// AES-128-CFB, HMAC-SHA1 and random bytes come from the system's CommonCrypto.
+#include <cstdlib>
+#include <cstring>
+#include <CommonCrypto/CommonCryptor.h>
+#include <CommonCrypto/CommonHMAC.h>
+#endif
 
 #include "core/net/p2p_crypto.h"
 
@@ -15,6 +24,7 @@ namespace Core::Net::P2P {
 constexpr size_t IvSeedSize = 4;
 constexpr size_t SignatureSize = 4;
 
+#ifdef ENABLE_LIBRESSL
 bool Crypt(std::vector<u8>& payload, const P2PKey& key, const std::array<u8, 4>& iv_seed,
            bool encrypt) {
     std::array<u8, 16> iv;
@@ -56,6 +66,58 @@ std::array<u8, 4> DeriveCommunicationId(std::span<const u8, 16> value) {
     std::copy_n(digest.begin(), id.size(), id.begin());
     return id;
 }
+
+#else
+bool Crypt(std::vector<u8>& payload, const P2PKey& key, const std::array<u8, 4>& iv_seed,
+           bool encrypt) {
+    std::array<u8, 16> iv;
+    for (size_t i = 0; i < iv.size(); ++i) {
+        iv[i] = iv_seed[i & 3];
+    }
+    CCCryptorRef context = nullptr;
+    if (CCCryptorCreateWithMode(encrypt ? kCCEncrypt : kCCDecrypt, kCCModeCFB, kCCAlgorithmAES,
+                                ccNoPadding, iv.data(), key.value.data(), key.value.size(), nullptr,
+                                0, 0, 0, &context) != kCCSuccess) {
+        return false;
+    }
+    size_t output_size = 0;
+    size_t final_size = 0;
+    const bool ok = CCCryptorUpdate(context, payload.data(), payload.size(), payload.data(),
+                                    payload.size(), &output_size) == kCCSuccess &&
+                    CCCryptorFinal(context, payload.data() + output_size,
+                                   payload.size() - output_size, &final_size) == kCCSuccess;
+    CCCryptorRelease(context);
+    return ok && output_size + final_size == payload.size();
+}
+
+std::array<u8, SignatureSize> Sign(std::span<const u8> body, const P2PKey& key) {
+    std::array<u8, CC_SHA1_DIGEST_LENGTH> digest{};
+    CCHmac(kCCHmacAlgSHA1, key.value.data(), key.value.size(), body.data(), body.size(),
+           digest.data());
+    std::array<u8, SignatureSize> signature{};
+    std::copy_n(digest.begin(), signature.size(), signature.begin());
+    return signature;
+}
+
+std::array<u8, 4> DeriveCommunicationId(std::span<const u8, 16> value) {
+    std::array<u8, CC_SHA1_DIGEST_LENGTH> digest{};
+    const u8 empty = 0;
+    CCHmac(kCCHmacAlgSHA1, value.data(), value.size(), &empty, 0, digest.data());
+    std::array<u8, 4> id{};
+    std::copy_n(digest.begin(), id.size(), id.begin());
+    return id;
+}
+
+static int RAND_bytes(u8* out, int size) {
+    arc4random_buf(out, static_cast<size_t>(size));
+    return 1;
+}
+
+static int CRYPTO_memcmp(const void* a, const void* b, size_t size) {
+    return timingsafe_bcmp(a, b, size);
+}
+
+#endif
 
 bool ProtectPayload(std::span<const u8> data, bool encrypt, bool sign, const P2PKey& key,
                     std::vector<u8>& output) {

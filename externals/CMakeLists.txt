@@ -266,7 +266,9 @@ if (WIN32)
 add_subdirectory(ext-wepoll)
 endif()
 
-add_subdirectory(aacdec)
+if (ENABLE_GPL_INCOMPATIBLE_LIBS)
+    add_subdirectory(aacdec)
+endif()
 
 #nlohmann json 
 if (NOT TARGET nlohmann_json::nlohmann_json)
@@ -344,7 +346,9 @@ add_subdirectory(openal-soft EXCLUDE_FROM_ALL)
 endif()
 
 # LibreSSL
-if (TARGET LibreSSL::SSL OR TARGET LibreSSL::Crypto)
+if (NOT ENABLE_GPL_INCOMPATIBLE_LIBS)
+    # left out: see the option in the top-level CMakeLists.txt
+elseif (TARGET LibreSSL::SSL OR TARGET LibreSSL::Crypto)
     set(SSL_DEPENDENCIES LibreSSL::SSL LibreSSL::Crypto)
 elseif (TARGET OpenSSL::SSL OR TARGET OpenSSL::Crypto)
     set(SSL_DEPENDENCIES OpenSSL::SSL OpenSSL::Crypto)

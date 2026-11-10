@@ -169,6 +169,13 @@ s32 AjmContext::InstanceCreate(AjmCodecType codec_type, AjmInstanceFlags flags, 
     if (!IsRegistered(codec_type)) {
         return ORBIS_AJM_ERROR_CODEC_NOT_REGISTERED;
     }
+#ifndef ENABLE_FDK_AAC
+    // fifa-hybrid: built without the FDK AAC library (its licence is not GPL-compatible).
+    if (codec_type == AjmCodecType::M4aacDec) {
+        LOG_ERROR(Lib_Ajm, "AAC decoding is not part of this build");
+        return ORBIS_AJM_ERROR_CODEC_NOT_SUPPORTED;
+    }
+#endif
     std::optional<u32> opt_index;
     {
         std::unique_lock lock(instances_mutex);
