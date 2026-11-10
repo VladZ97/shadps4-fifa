@@ -21,6 +21,10 @@
 #include <vector>
 #include <setjmp.h>
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <pthread.h>
+#endif
 #include "bbgpu.h"
 extern "C" {
 #include "core/bbgpu_split/gpu_process.h"
@@ -506,14 +510,99 @@ BB_EXPORT void runtime_thread_set_blocked(const char* what, uint64_t resource) {
     (void)resource;
 }
 BB_EXPORT void runtime_thread_clear_blocked(void) {}
+#ifdef __APPLE__
+// Local change (0.5.1-f): CPU time of the game's threads for the renderer's frame spike log
+// (SHAD_GAME_CPU=1; one thread_info per thread at every flip, so off by default).
+namespace {
+bool GameCpuStats() {
+    static const bool on = [] {
+        const char* v = std::getenv("SHAD_GAME_CPU");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+u64 PortCpuNs(mach_port_t port) {
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(port, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) !=
+        KERN_SUCCESS) {
+        return 0;
+    }
+    return (u64(info.user_time.seconds) + u64(info.system_time.seconds)) * 1000000000ull +
+           (u64(info.user_time.microseconds) + u64(info.system_time.microseconds)) * 1000ull;
+}
+void PortName(mach_port_t port, char name[32]) {
+    name[0] = '\0';
+    if (const pthread_t thread = pthread_from_mach_thread_np(port)) {
+        pthread_getname_np(thread, name, 32);
+    }
+}
+std::atomic<mach_port_t> g_game_main_port{MACH_PORT_NULL};
+} // namespace
+#endif
 BB_EXPORT uint64_t runtime_thread_cpu_ns(int which) {
+#ifdef __APPLE__
+    if (!GameCpuStats()) {
+        return 0;
+    }
+    if (which) {
+        return PortCpuNs(pthread_mach_thread_np(pthread_self()));
+    }
+    const mach_port_t main_port = g_game_main_port.load(std::memory_order_relaxed);
+    return main_port != MACH_PORT_NULL ? PortCpuNs(main_port) : 0;
+#else
     (void)which;
     return 0;
+#endif
 }
 BB_EXPORT void runtime_game_cpu_since_last(uint64_t* total, uint64_t* busiest, char name[32]) {
     *total = 0;
     *busiest = 0;
     name[0] = '\0';
+#ifdef __APPLE__
+    if (!GameCpuStats()) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::map<mach_port_t, u64> last;
+    std::scoped_lock lock{mutex};
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t count = 0;
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+        return;
+    }
+    std::map<mach_port_t, u64> now;
+    mach_port_t busiest_port = MACH_PORT_NULL;
+    for (mach_msg_type_number_t i = 0; i < count; ++i) {
+        const mach_port_t port = threads[i];
+        const u64 ns = PortCpuNs(port);
+        now[port] = ns;
+        const auto it = last.find(port);
+        const u64 before = it != last.end() ? it->second : ns;
+        const u64 delta = ns >= before ? ns - before : 0;
+        *total += delta;
+        if (delta > *busiest) {
+            *busiest = delta;
+            busiest_port = port;
+        }
+        if (g_game_main_port.load(std::memory_order_relaxed) == MACH_PORT_NULL) {
+            char thread_name[32];
+            PortName(port, thread_name);
+            if (!std::strcmp(thread_name, "Game:Main")) {
+                g_game_main_port.store(port, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (busiest_port != MACH_PORT_NULL) {
+        PortName(busiest_port, name);
+    }
+    for (mach_msg_type_number_t i = 0; i < count; ++i) {
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads),
+                  count * sizeof(thread_act_t));
+    last.swap(now);
+#endif
 }
 BB_EXPORT void runtime_sampler_flip(uint64_t main_cpu_ns) {
     (void)main_cpu_ns;

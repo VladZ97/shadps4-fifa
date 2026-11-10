@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "common/assert.h"
 #include "common/types.h"
@@ -57,6 +58,10 @@ public:
 
 private:
     std::vector<SymbolRecord> m_symbols;
+    /// Symbol name -> positions in m_symbols, in insertion order. FindSymbol walked the whole
+    /// list for every import (seconds of the start for a large game); it now compares only the
+    /// records of that name, in the same order, so the first match is the same one.
+    std::unordered_map<std::string, std::vector<u32>> m_by_name;
 };
 
 } // namespace Core::Loader

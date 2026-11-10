@@ -32,7 +32,94 @@
 #include <sys/sysctl.h>
 #endif
 
+#ifdef __APPLE__
+#include <cstdlib>
+#include <cstring>
+#include <AudioToolbox/AudioToolbox.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
+
+// Local change (0.5.1-f): with the split renderer the picture is in the GPU host's window and
+// this process has none, so macOS treats it as an idle background app (App Nap): every thread
+// was clamped to utility priority (20, below all normal work on the machine; measured with
+// ps -M during a match) and its timers were coalesced. A user-initiated, latency-critical
+// activity for the life of the process opts out. SHAD_APP_NAP=1 keeps the old behaviour.
+static void KeepProcessInteractive() {
+    if (const char* v = std::getenv("SHAD_APP_NAP"); v && v[0] == '1') {
+        return;
+    }
+    const auto cls = [](const char* name) { return reinterpret_cast<id>(objc_getClass(name)); };
+    const id info = reinterpret_cast<id (*)(id, SEL)>(objc_msgSend)(
+        cls("NSProcessInfo"), sel_registerName("processInfo"));
+    const id reason = reinterpret_cast<id (*)(id, SEL, const char*)>(objc_msgSend)(
+        cls("NSString"), sel_registerName("stringWithUTF8String:"), "Game running");
+    if (!info || !reason) {
+        return;
+    }
+    // NSActivityUserInitiated (0x00FFFFFF, includes idle system sleep disabled) |
+    // NSActivityLatencyCritical (0xFF00000000).
+    const unsigned long long options = 0x00FFFFFFULL | 0xFF00000000ULL;
+    const id activity = reinterpret_cast<id (*)(id, SEL, unsigned long long, id)>(objc_msgSend)(
+        info, sel_registerName("beginActivityWithOptions:reason:"), options, reason);
+    if (activity) {
+        // Never ended: the activity lasts as long as the process.
+        reinterpret_cast<id (*)(id, SEL)>(objc_msgSend)(activity, sel_registerName("retain"));
+    }
+}
+
+// Local change (0.5.1-i): with the split renderer the GPU host is the full-screen game, so macOS
+// Game Mode treats this process, which runs the game itself, as a background app and clamps every
+// thread to priority 4 (task role "darwinbg application") until the game first plays sound. A
+// first launch spent 46 to 55 s instead of 7 s preparing the game's code, and each later boot
+// was slowed the same way up to the first sound. A process with a running audio output is
+// exempt, so a silent output queue runs for the life of the process. It is separate from the
+// game's own audio device and does not change its format. SHAD_BOOT_AUDIO=0 turns it off.
+static void SilentQueueCallback(void*, AudioQueueRef queue, AudioQueueBufferRef buffer) {
+    std::memset(buffer->mAudioData, 0, buffer->mAudioDataBytesCapacity);
+    buffer->mAudioDataByteSize = buffer->mAudioDataBytesCapacity;
+    AudioQueueEnqueueBuffer(queue, buffer, 0, nullptr);
+}
+
+static void KeepAudioActive() {
+    if (const char* v = std::getenv("SHAD_BOOT_AUDIO"); v && v[0] == '0') {
+        return;
+    }
+    AudioStreamBasicDescription format{};
+    format.mSampleRate = 48000.0;
+    format.mFormatID = kAudioFormatLinearPCM;
+    format.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    format.mChannelsPerFrame = 2;
+    format.mBitsPerChannel = 32;
+    format.mBytesPerFrame = 8;
+    format.mBytesPerPacket = 8;
+    format.mFramesPerPacket = 1;
+    AudioQueueRef queue = nullptr;
+    // No run loop given: the callback runs on the queue's own thread.
+    if (AudioQueueNewOutput(&format, SilentQueueCallback, nullptr, nullptr, nullptr, 0, &queue) !=
+        noErr) {
+        return;
+    }
+    constexpr UInt32 BufferBytes = 24000 * 8; // half a second each
+    for (int i = 0; i < 3; ++i) {
+        AudioQueueBufferRef buffer = nullptr;
+        if (AudioQueueAllocateBuffer(queue, BufferBytes, &buffer) != noErr) {
+            AudioQueueDispose(queue, true);
+            return;
+        }
+        SilentQueueCallback(nullptr, queue, buffer);
+    }
+    if (AudioQueueStart(queue, nullptr) != noErr) {
+        AudioQueueDispose(queue, true);
+    }
+    // Never stopped: the queue lasts as long as the process.
+}
+#endif
+
 int main(int argc, char* argv[]) {
+#ifdef __APPLE__
+    KeepProcessInteractive();
+    KeepAudioActive();
+#endif
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif

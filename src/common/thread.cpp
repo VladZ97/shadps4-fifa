@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <string>
 #include <thread>
@@ -19,6 +22,7 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/mach_traps.h>
 #include <pthread.h>
 #elif defined(_WIN32)
 #include <windows.h>
@@ -322,6 +326,25 @@ std::string GetCurrentThreadName() {
     }
     return std::string{name};
 #endif
+}
+
+void YieldThread() {
+#ifdef __APPLE__
+    static const bool legacy = [] {
+        const char* env = std::getenv("SHAD_GUEST_YIELD");
+        return env && std::strcmp(env, "legacy") == 0;
+    }();
+    static std::atomic<u64> calls{0};
+    const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0 && n >= 1024) {
+        LOG_INFO(Common, "yield calls so far: {} ({})", n, legacy ? "legacy" : "swtch");
+    }
+    if (!legacy) {
+        swtch();
+        return;
+    }
+#endif
+    std::this_thread::yield();
 }
 
 } // namespace Common

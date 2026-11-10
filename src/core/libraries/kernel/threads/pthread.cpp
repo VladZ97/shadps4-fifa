@@ -418,11 +418,11 @@ PthreadT PS4_SYSV_ABI posix_pthread_self() {
 }
 
 void PS4_SYSV_ABI posix_pthread_yield() {
-    std::this_thread::yield();
+    Common::YieldThread();
 }
 
 void PS4_SYSV_ABI sched_yield() {
-    std::this_thread::yield();
+    Common::YieldThread();
 }
 
 int PS4_SYSV_ABI posix_getpid() {
@@ -1230,7 +1230,7 @@ int PS4_SYSV_ABI posix_pthread_suspend_user_context_np(PthreadT thread) {
         if (pthr) {
             pthread_kill(pthr, SIGSLEEP);
             for (int i = 0; i < 1000 && !thread->is_suspended_in_signal; ++i) {
-                std::this_thread::yield();
+                Common::YieldThread();
             }
         }
     }

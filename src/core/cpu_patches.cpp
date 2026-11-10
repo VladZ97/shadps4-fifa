@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include <Zydis/Zydis.h>
@@ -29,6 +30,16 @@
 #include "core/signals.h"
 #include "core/tls.h"
 #include "cpu_patches.h"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <xxhash.h>
+#include "common/path_util.h"
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -986,10 +997,13 @@ struct PatchModule {
     /// Prevents repeated generation attempts after the fixed trampoline area is exhausted.
     bool trampoline_exhausted{};
 
+    /// Size of the trampoline area.
+    u64 trampoline_capacity{};
+
     PatchModule(u8* module_ptr, const u64 module_size, u8* trampoline_ptr,
                 const u64 trampoline_size)
         : start(module_ptr), end(module_ptr + module_size), patch_gen(module_size, module_ptr),
-          trampoline_gen(trampoline_size, trampoline_ptr) {}
+          trampoline_gen(trampoline_size, trampoline_ptr), trampoline_capacity(trampoline_size) {}
 };
 static std::map<u64, PatchModule> modules;
 
@@ -2007,6 +2021,67 @@ const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
 
 using AddressRanges = std::vector<std::pair<uintptr_t, uintptr_t>>;
 
+// fifa 0.5.1-i: progress of the first launch. Without a patch cache the patcher walks the game's
+// 60 MB executable for most of a minute with nothing on screen. Its position goes into the file
+// named by BB_PROGRESS_FILE as "prepare <0..1000>" (replaced at most ten times a second): the GPU
+// host shows it as a bar in the game window and the launcher in its status line. Only large
+// segments report (the other modules take a second or two); a cached start never writes it.
+class PatchProgress {
+public:
+    PatchProgress(u64 base_, u64 size_) : base{base_}, size{size_} {
+        const char* file = std::getenv("BB_PROGRESS_FILE");
+        if (file != nullptr && *file != 0 && size >= MinSegmentSize) {
+            path = file;
+            Write(0);
+        }
+    }
+    ~PatchProgress() {
+        Done();
+    }
+    /// The patcher reached `address` in the pass that covers `from`..`to` of the bar.
+    /// `part` (0..1) of the step that takes the bar from `from` to `to` (per mille) is done.
+    void At(double part, u32 from, u32 to) {
+        if (path.empty() || (++calls & 0x3f) != 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::milliseconds(100)) {
+            return;
+        }
+        last = now;
+        Write(std::min<u32>(999, from + u32(std::clamp(part, 0.0, 1.0) * double(to - from))));
+    }
+    double AddressPart(uintptr_t address) const {
+        return double(address - base) / double(size);
+    }
+    void Done() {
+        if (!path.empty()) {
+            Write(1000);
+            path.clear();
+        }
+    }
+
+    static constexpr u32 FunctionsEnd = 950; ///< share of the bar the function pass takes
+
+private:
+    static constexpr u64 MinSegmentSize = 16ULL << 20;
+
+    void Write(u32 permille) {
+        const std::string tmp = path + ".tmp";
+        if (std::FILE* f = std::fopen(tmp.c_str(), "w")) {
+            std::fprintf(f, "prepare %u\n", permille);
+            std::fclose(f);
+            std::rename(tmp.c_str(), path.c_str());
+        }
+    }
+
+    u64 base, size;
+    std::string path;
+    u32 calls = 0;
+    std::chrono::steady_clock::time_point last{};
+};
+static std::atomic<PatchProgress*> patch_progress{nullptr};
+
 /// Applies the CPU patches to every function of the segment. If red_zone_protection is true,
 /// the red-zone accesses of those functions are protected as well. If covered_ranges is not
 /// null, it receives the sorted address ranges of the decoded instructions.
@@ -2039,6 +2114,11 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
             function_index + 1 < starts.size() ? starts[function_index + 1] : segment_end;
         if (function_end <= function_start) {
             continue;
+        }
+        if (auto* progress = patch_progress.load(std::memory_order_relaxed)) {
+            // By count: the functions end well before the segment does (data follows the code).
+            progress->At(double(function_index) / double(starts.size()), 0,
+                         PatchProgress::FunctionsEnd);
         }
 
         ++result.function_count;
@@ -2623,6 +2703,9 @@ static void PatchUncoveredCpuInstructions(u64 segment_addr, const AddressRanges&
     uintptr_t cursor = segment_addr;
     for (const auto& [range_start, range_end] : covered_ranges) {
         if (range_start > cursor) {
+            if (auto* progress = patch_progress.load(std::memory_order_relaxed)) {
+                progress->At(progress->AddressPart(cursor), PatchProgress::FunctionsEnd, 1000);
+            }
             patch_gap(cursor, range_start);
         }
         cursor = std::max(cursor, range_end);
@@ -2634,13 +2717,361 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
     return PatchSegmentStatically(segment_addr, segment_size, function_starts, true, nullptr);
 }
 
-RedZonePatchResult PatchCpuInstructionsStatically(u64 segment_addr, u64 segment_size,
-                                                  std::span<const uintptr_t> function_starts) {
+static RedZonePatchResult PatchCpuInstructionsUncached(u64 segment_addr, u64 segment_size,
+                                                       std::span<const uintptr_t> function_starts) {
     AddressRanges covered_ranges;
     auto result =
         PatchSegmentStatically(segment_addr, segment_size, function_starts, false, &covered_ranges);
     // The EH frame search table does not list every function of every module.
     PatchUncoveredCpuInstructions(segment_addr, covered_ranges, result);
+    return result;
+}
+
+// ---- Static patch cache ---------------------------------------------------------------------
+// Decoding and analysing every function of a 60 MB executable takes over a minute under Rosetta.
+// The outcome is a pure function of the code bytes, the function list, the addresses involved and
+// this binary, so it is stored after the first start and replayed afterwards: the changed bytes of
+// the segment, the trampolines, and the patcher's bookkeeping. Anything that differs (another
+// build of the emulator, another game binary, a memory patch, another address) changes the key and
+// the patcher runs as before. SHAD_PATCH_CACHE=0 turns it off, SHAD_PATCH_CACHE=verify runs the
+// patcher and compares its outcome with the stored one.
+namespace {
+
+struct PatchCacheKey {
+    u64 magic;
+    u8 build_uuid[16];
+    u64 anchor_code;
+    u64 anchor_data;
+    u64 cpu_bits;
+    u64 module_start;
+    u64 module_size;
+    u64 segment_addr;
+    u64 segment_size;
+    u64 trampoline_base;
+    u64 trampoline_capacity;
+    u64 trampoline_before;
+    u64 patched_before;
+    u64 exhausted_before;
+    u64 code_hash;
+    u64 starts_hash;
+    u64 starts_count;
+};
+
+struct PatchCacheHeader {
+    PatchCacheKey key;
+    u64 trampoline_after;
+    u64 exhausted_after;
+    u64 tables_initialized;
+    RedZonePatchResult result;
+    u64 run_count;
+    u64 run_bytes;
+    u64 patched_count;
+    u64 body_size;
+    u64 body_hash;
+};
+
+struct PatchCacheRun {
+    u32 offset;
+    u32 length;
+};
+
+constexpr u64 PatchCacheMagic = 0x3130434150445348ULL; // "HSDPAC01"
+
+enum class PatchCacheMode { Off, On, Verify };
+
+PatchCacheMode GetPatchCacheMode() {
+    static const PatchCacheMode mode = [] {
+        const char* e = std::getenv("SHAD_PATCH_CACHE");
+        if (e == nullptr) {
+            return PatchCacheMode::On;
+        }
+        if (e[0] == '0') {
+            return PatchCacheMode::Off;
+        }
+        if (e[0] == 'v') {
+            return PatchCacheMode::Verify;
+        }
+        return PatchCacheMode::On;
+    }();
+    return mode;
+}
+
+bool GetBuildUuid(u8 out[16]) {
+#if defined(__APPLE__)
+    const auto* header = reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(0));
+    if (header == nullptr || header->magic != MH_MAGIC_64) {
+        return false;
+    }
+    const auto* command = reinterpret_cast<const load_command*>(header + 1);
+    for (u32 i = 0; i < header->ncmds; ++i) {
+        if (command->cmd == LC_UUID) {
+            std::memcpy(out, reinterpret_cast<const uuid_command*>(command)->uuid, 16);
+            return true;
+        }
+        command = reinterpret_cast<const load_command*>(reinterpret_cast<const u8*>(command) +
+                                                         command->cmdsize);
+    }
+#endif
+    return false;
+}
+
+u64 PatchCacheCpuBits() {
+    Cpu cpu;
+    u64 bits = 0;
+    u32 n = 0;
+    const auto add = [&](bool has) { bits |= u64(has) << n++; };
+    add(cpu.has(Cpu::tINTEL));
+    add(cpu.has(Cpu::tAMD));
+    add(cpu.has(Cpu::tSSE4a));
+    add(cpu.has(Cpu::tSSE41));
+    add(cpu.has(Cpu::tSSE42));
+    add(cpu.has(Cpu::tAVX));
+    add(cpu.has(Cpu::tAVX2));
+    add(cpu.has(Cpu::tBMI1));
+    add(cpu.has(Cpu::tBMI2));
+    add(cpu.has(Cpu::tFMA));
+    add(cpu.has(Cpu::tF16C));
+    add(cpu.has(Cpu::tLZCNT));
+    add(cpu.has(Cpu::tPOPCNT));
+    add(cpu.has(Cpu::tMOVBE));
+    return bits;
+}
+
+std::filesystem::path PatchCachePath(const std::filesystem::path& dir, const PatchCacheKey& key) {
+    return dir / fmt::format("{:016x}.spc", XXH3_64bits(&key, sizeof(key)));
+}
+
+bool ReadPatchCache(const std::filesystem::path& path, const PatchCacheKey& key,
+                    PatchCacheHeader& header, std::vector<u8>& body) {
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        return false;
+    }
+    bool ok = std::fread(&header, sizeof(header), 1, file) == 1 &&
+              std::memcmp(&header.key, &key, sizeof(key)) == 0 && header.body_size < (1ULL << 31);
+    if (ok) {
+        body.resize(header.body_size);
+        ok = std::fread(body.data(), 1, body.size(), file) == body.size() &&
+             XXH3_64bits(body.data(), body.size()) == header.body_hash &&
+             header.body_size == header.run_count * sizeof(PatchCacheRun) + header.run_bytes +
+                                     (header.trampoline_after - key.trampoline_before) +
+                                     header.patched_count * sizeof(u64);
+    }
+    std::fclose(file);
+    return ok;
+}
+
+void WritePatchCache(const std::filesystem::path& path, const PatchCacheHeader& header,
+                     const std::vector<u8>& body) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    const auto temp = std::filesystem::path(path.string() + ".tmp");
+    std::FILE* file = std::fopen(temp.c_str(), "wb");
+    if (file == nullptr) {
+        return;
+    }
+    const bool ok = std::fwrite(&header, sizeof(header), 1, file) == 1 &&
+                    std::fwrite(body.data(), 1, body.size(), file) == body.size();
+    if (std::fclose(file) != 0 || !ok) {
+        std::filesystem::remove(temp, ec);
+        return;
+    }
+    std::filesystem::rename(temp, path, ec);
+    if (ec) {
+        std::filesystem::remove(temp, ec);
+    }
+}
+
+double PatchCacheMs(std::chrono::steady_clock::time_point since) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since)
+        .count();
+}
+
+} // namespace
+
+RedZonePatchResult PatchCpuInstructionsStatically(u64 segment_addr, u64 segment_size,
+                                                  std::span<const uintptr_t> function_starts) {
+    const PatchCacheMode mode = GetPatchCacheMode();
+    auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
+    PatchCacheKey key{};
+    if (mode == PatchCacheMode::Off || module == nullptr || function_starts.empty() ||
+        segment_size == 0 || segment_size >= (1ULL << 32) || !GetBuildUuid(key.build_uuid)) {
+        return PatchCpuInstructionsUncached(segment_addr, segment_size, function_starts);
+    }
+
+    const auto start_time = std::chrono::steady_clock::now();
+    auto* segment = reinterpret_cast<u8*>(segment_addr);
+    key.magic = PatchCacheMagic;
+    key.anchor_code = reinterpret_cast<u64>(&PatchCpuInstructionsUncached);
+    key.anchor_data = reinterpret_cast<u64>(rcp_index_table.data());
+    key.cpu_bits = PatchCacheCpuBits();
+    key.module_start = reinterpret_cast<u64>(module->start);
+    key.module_size = module->end - module->start;
+    key.segment_addr = segment_addr;
+    key.segment_size = segment_size;
+    std::set<u8*> patched_before;
+    {
+        std::unique_lock lock{module->mutex};
+        key.trampoline_base = reinterpret_cast<u64>(module->trampoline_gen.getCode());
+        key.trampoline_capacity = module->trampoline_capacity;
+        key.trampoline_before = module->trampoline_gen.getSize();
+        key.patched_before = module->patched.size();
+        key.exhausted_before = module->trampoline_exhausted;
+        patched_before = module->patched;
+    }
+    key.code_hash = XXH3_64bits(segment, segment_size);
+    key.starts_hash = XXH3_64bits(function_starts.data(), function_starts.size_bytes());
+    key.starts_count = function_starts.size();
+    const double key_ms = PatchCacheMs(start_time);
+
+    const auto user_dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "static_patches";
+    PatchCacheHeader header{};
+    std::vector<u8> body;
+    bool found = ReadPatchCache(PatchCachePath(user_dir, key), key, header, body);
+    if (!found) {
+        if (const char* seed = std::getenv("SHAD_PATCH_SEED_DIR"); seed != nullptr && seed[0]) {
+            found = ReadPatchCache(PatchCachePath(seed, key), key, header, body);
+        }
+    }
+
+    if (found && mode == PatchCacheMode::On) {
+        const u64 trampoline_bytes = header.trampoline_after - key.trampoline_before;
+        const auto* runs = reinterpret_cast<const PatchCacheRun*>(body.data());
+        const u8* run_data = body.data() + header.run_count * sizeof(PatchCacheRun);
+        const u8* trampoline_data = run_data + header.run_bytes;
+        const u8* patched_data = trampoline_data + trampoline_bytes;
+        bool valid = header.trampoline_after <= key.trampoline_capacity &&
+                     header.trampoline_after >= key.trampoline_before;
+        u64 run_total = 0;
+        for (u64 i = 0; valid && i < header.run_count; ++i) {
+            valid = u64(runs[i].offset) + runs[i].length <= segment_size;
+            run_total += runs[i].length;
+        }
+        valid = valid && run_total == header.run_bytes;
+        if (valid) {
+            if (header.tables_initialized) {
+                InitializeIndexTables();
+            }
+            std::unique_lock lock{module->mutex};
+            for (u64 i = 0; i < header.run_count; ++i) {
+                std::memcpy(segment + runs[i].offset, run_data, runs[i].length);
+                run_data += runs[i].length;
+            }
+            std::memcpy(const_cast<u8*>(module->trampoline_gen.getCode()) + key.trampoline_before,
+                        trampoline_data, trampoline_bytes);
+            module->trampoline_gen.setSize(header.trampoline_after);
+            for (u64 i = 0; i < header.patched_count; ++i) {
+                u64 offset;
+                std::memcpy(&offset, patched_data + i * sizeof(u64), sizeof(u64));
+                module->patched.insert(module->patched.end(), module->start + offset);
+            }
+            module->trampoline_exhausted = header.exhausted_after != 0;
+            std::fprintf(stderr,
+                         "[PATCHCACHE] hit: %llu byte runs (%llu bytes), %llu trampoline bytes, "
+                         "%llu patched sites replayed in %.1f ms (key %.1f ms, %.1f MB)\n",
+                         (unsigned long long)header.run_count,
+                         (unsigned long long)header.run_bytes,
+                         (unsigned long long)trampoline_bytes,
+                         (unsigned long long)header.patched_count, PatchCacheMs(start_time),
+                         key_ms, double(segment_size) / (1024.0 * 1024.0));
+            return header.result;
+        }
+        found = false;
+    }
+
+    // Run the patcher and record what it did.
+    std::vector<u8> original(segment, segment + segment_size);
+    const auto patch_time = std::chrono::steady_clock::now();
+    PatchProgress progress{segment_addr, segment_size};
+    patch_progress.store(&progress, std::memory_order_relaxed);
+    const auto result = PatchCpuInstructionsUncached(segment_addr, segment_size, function_starts);
+    patch_progress.store(nullptr, std::memory_order_relaxed);
+    progress.Done();
+    const double patch_ms = PatchCacheMs(patch_time);
+
+    PatchCacheHeader fresh{};
+    fresh.key = key;
+    fresh.result = result;
+    fresh.tables_initialized = rcp_index_tables_initialized;
+    std::vector<PatchCacheRun> runs;
+    std::vector<u8> run_bytes;
+    std::vector<u8> tail;
+    {
+        std::unique_lock lock{module->mutex};
+        fresh.trampoline_after = module->trampoline_gen.getSize();
+        fresh.exhausted_after = module->trampoline_exhausted;
+        constexpr u64 MergeGap = 16;
+        u64 offset = 0;
+        while (offset < segment_size) {
+            if (segment_size - offset >= 8 &&
+                std::memcmp(segment + offset, original.data() + offset, 8) == 0) {
+                offset += 8;
+                continue;
+            }
+            if (segment[offset] == original[offset]) {
+                ++offset;
+                continue;
+            }
+            u64 end = offset + 1;
+            u64 last_diff = offset;
+            while (end < segment_size && end - last_diff <= MergeGap) {
+                if (segment[end] != original[end]) {
+                    last_diff = end;
+                }
+                ++end;
+            }
+            end = last_diff + 1;
+            runs.push_back({u32(offset), u32(end - offset)});
+            run_bytes.insert(run_bytes.end(), segment + offset, segment + end);
+            offset = end;
+        }
+        if (fresh.trampoline_after >= key.trampoline_before) {
+            const u8* base = module->trampoline_gen.getCode();
+            tail.assign(base + key.trampoline_before, base + fresh.trampoline_after);
+        }
+        for (u8* site : module->patched) {
+            if (!patched_before.contains(site)) {
+                const u64 site_offset = site - module->start;
+                const auto* bytes = reinterpret_cast<const u8*>(&site_offset);
+                tail.insert(tail.end(), bytes, bytes + sizeof(u64));
+                ++fresh.patched_count;
+            }
+        }
+    }
+    if (fresh.trampoline_after < key.trampoline_before) {
+        return result;
+    }
+    fresh.run_count = runs.size();
+    fresh.run_bytes = run_bytes.size();
+    std::vector<u8> fresh_body;
+    fresh_body.reserve(runs.size() * sizeof(PatchCacheRun) + run_bytes.size() + tail.size());
+    const auto* run_table = reinterpret_cast<const u8*>(runs.data());
+    fresh_body.insert(fresh_body.end(), run_table, run_table + runs.size() * sizeof(PatchCacheRun));
+    fresh_body.insert(fresh_body.end(), run_bytes.begin(), run_bytes.end());
+    fresh_body.insert(fresh_body.end(), tail.begin(), tail.end());
+    fresh.body_size = fresh_body.size();
+    fresh.body_hash = XXH3_64bits(fresh_body.data(), fresh_body.size());
+
+    if (found && mode == PatchCacheMode::Verify) {
+        const bool same = std::memcmp(&fresh, &header, sizeof(header)) == 0 && fresh_body == body;
+        std::fprintf(stderr,
+                     "[PATCHCACHE] verify %s: %llu byte runs, %llu trampoline bytes, %llu sites "
+                     "(patcher %.0f ms)\n",
+                     same ? "ok" : "MISMATCH", (unsigned long long)fresh.run_count,
+                     (unsigned long long)(fresh.trampoline_after - key.trampoline_before),
+                     (unsigned long long)fresh.patched_count, patch_ms);
+        if (same) {
+            return result;
+        }
+    }
+    WritePatchCache(PatchCachePath(user_dir, key), fresh, fresh_body);
+    std::fprintf(stderr,
+                 "[PATCHCACHE] stored: %llu byte runs (%llu bytes), %llu trampoline bytes, %llu "
+                 "patched sites, %.1f MB (patcher %.0f ms)\n",
+                 (unsigned long long)fresh.run_count, (unsigned long long)fresh.run_bytes,
+                 (unsigned long long)(fresh.trampoline_after - key.trampoline_before),
+                 (unsigned long long)fresh.patched_count,
+                 double(sizeof(fresh) + fresh_body.size()) / 1048576.0, patch_ms);
     return result;
 }
 

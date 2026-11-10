@@ -8,7 +8,7 @@ port. Dates are the commit dates; the full history is in git. Upstream: https://
 | M | `CMakeLists.txt` | 2026-11-03 |
 | M | `src/common/path_util.cpp` | 2026-11-06 |
 | M | `src/core/address_space.cpp` | 2026-11-03 |
-| A | `src/core/bbgpu_bridge.cpp` | 2026-11-06 |
+| A | `src/core/bbgpu_bridge.cpp` | 2026-11-10 |
 | A | `src/core/bbgpu_bridge.h` | 2026-11-06 |
 | A | `src/core/bbgpu_split/gpu_process.c` | 2026-11-06 |
 | A | `src/core/bbgpu_split/gpu_process.h` | 2026-11-06 |
@@ -24,9 +24,9 @@ port. Dates are the commit dates; the full history is in git. Upstream: https://
 | M | `src/core/libraries/libs.cpp` | 2026-11-03 |
 | M | `src/core/libraries/videoout/driver.cpp` | 2026-10-29 |
 | M | `src/core/libraries/videoout/video_out.cpp` | 2026-10-28 |
-| M | `src/core/linker.cpp` | 2026-11-06 |
+| M | `src/core/linker.cpp` | 2026-11-10 |
 | M | `src/core/linker.h` | 2026-11-06 |
-| M | `src/core/memory.cpp` | 2026-11-06 |
+| M | `src/core/memory.cpp` | 2026-11-10 |
 | M | `src/core/memory.h` | 2026-11-06 |
 | M | `src/core/module.cpp` | 2026-11-06 |
 | M | `src/core/module.h` | 2026-11-06 |
@@ -60,3 +60,13 @@ port. Dates are the commit dates; the full history is in git. Upstream: https://
 | M | `src/video_core/texture_cache/image_view.cpp` | 2026-10-28 |
 | M | `src/video_core/texture_cache/texture_cache.cpp` | 2026-10-29 |
 | M | `src/video_core/texture_cache/texture_cache.h` | 2026-10-29 |
+| M | `src/common/thread.cpp` | 2026-11-10 |
+| M | `src/common/thread.h` | 2026-11-10 |
+| M | `src/core/libraries/kernel/equeue.cpp` | 2026-11-10 |
+| M | `src/core/libraries/kernel/threads/mutex.cpp` | 2026-11-10 |
+| M | `src/core/libraries/kernel/threads/pthread.cpp` | 2026-11-10 |
+| M | `src/core/thread.cpp` | 2026-11-10 |
+| M | `src/main.cpp` | 2026-11-10 |
+| M | `src/core/cpu_patches.cpp` | 2026-11-10 |
+| M | `src/core/loader/symbols_resolver.cpp` | 2026-11-10 |
+| M | `src/core/loader/symbols_resolver.h` | 2026-11-10 |

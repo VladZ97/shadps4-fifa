@@ -24,6 +24,13 @@ void SetCurrentThreadPriority(ThreadPriority new_priority);
 
 void SetCurrentThreadName(const char* name);
 
+/// fifa-hybrid: gives the core to another runnable thread of the same or a higher priority.
+/// std::this_thread::yield() is swtch_pri() on macOS: the caller drops to the lowest priority
+/// until every other runnable thread has run or a scheduler quantum (10 ms) has passed; a guest
+/// that yields in its job loops then loses whole frames when its threads fill the cores.
+/// SHAD_GUEST_YIELD=legacy restores std::this_thread::yield().
+void YieldThread();
+
 void SetThreadName(void* thread, const char* name);
 
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,

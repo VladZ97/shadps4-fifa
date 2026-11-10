@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdio>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -24,6 +26,12 @@
 #include "core/libraries/sysmodule/sysmodule.h"
 #include "core/libraries/sysmodule/sysmodule_internal.h"
 #include "core/bbgpu_bridge.h"
+#ifdef __APPLE__
+#include <cstdlib>
+#include <cstring>
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 #include "core/linker.h"
 #include "core/memory.h"
 #include "core/tls.h"
@@ -92,7 +100,12 @@ void Linker::Execute(const std::vector<std::string>& args) {
     }
 
     // Relocate all modules
+    const auto relocate_start = std::chrono::steady_clock::now();
     RelocateAllImports();
+    std::fprintf(stderr, "[STARTUP] imports relocated in %.0f ms\n",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                           relocate_start)
+                     .count());
 
     // libkernel entry is responsible for initializing malloc-related elements of libSceLibcInternal
     // this is done through calling _malloc_init, and sceLibcInternalMemoryMutexEnable.
@@ -149,6 +162,16 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
     main_thread.Run([this, module, &args, has_libcinternal](std::stop_token) {
         Common::SetCurrentThreadName("Game:Main");
+#ifdef __APPLE__
+        // Local change (0.5.1-f): same QoS as the other guest threads (core/thread.cpp); this
+        // thread does not go through NativeThread::Initialize.
+        if (const char* v = std::getenv("SHAD_GUEST_QOS");
+            !(v && (!std::strcmp(v, "off") || !std::strcmp(v, "0")))) {
+            pthread_set_qos_class_self_np(v && !std::strcmp(v, "in") ? QOS_CLASS_USER_INITIATED
+                                                                      : QOS_CLASS_USER_INTERACTIVE,
+                                          0);
+        }
+#endif
 
 #ifndef _WIN32 // Clear any existing signal mask for game threads.
         sigset_t emptyset;

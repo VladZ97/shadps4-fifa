@@ -12,6 +12,11 @@
 #include <csignal>
 #include <pthread.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <cstdlib>
+#include <cstring>
+#include <pthread/qos.h>
+#endif
 #ifdef ARCH_X86_64
 #include <xmmintrin.h>
 #endif
@@ -74,6 +79,26 @@ void NativeThread::Initialize() {
     tid = GetCurrentThreadId();
 #else
     tid = (u64)pthread_self();
+#ifdef __APPLE__
+    // Local change (0.5.1-f): guest threads were created with no QoS class (default, priority
+    // 31), below the renderer's user-interactive command thread and equal to every background
+    // job of the system. FIFA 16 keeps its main thread and four job threads ~80% busy in
+    // crowd cameras; whenever one of them was moved to an efficiency core or preempted, the
+    // frame was submitted ~50 ms late. SHAD_GUEST_QOS: ui (default), in (user initiated), off.
+    static const int guest_qos = [] {
+        const char* v = std::getenv("SHAD_GUEST_QOS");
+        if (v && (!std::strcmp(v, "off") || !std::strcmp(v, "0"))) {
+            return -1;
+        }
+        if (v && !std::strcmp(v, "in")) {
+            return int(QOS_CLASS_USER_INITIATED);
+        }
+        return int(QOS_CLASS_USER_INTERACTIVE);
+    }();
+    if (guest_qos >= 0) {
+        pthread_set_qos_class_self_np(static_cast<qos_class_t>(guest_qos), 0);
+    }
+#endif
 
     // Set up an alternate signal handler stack to avoid overflowing small thread stacks.
     const size_t page_size = getpagesize();

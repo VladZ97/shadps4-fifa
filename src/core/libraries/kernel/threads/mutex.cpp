@@ -4,6 +4,7 @@
 #include <thread>
 #include <fmt/format.h>
 
+#include "common/thread.h"
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/types.h"
@@ -226,7 +227,7 @@ s32 PthreadMutex::Lock(const OrbisKernelTimespec* abstime, u64 usec) {
 
         count = m_yieldloops;
         while (count--) {
-            std::this_thread::yield();
+            Common::YieldThread();
             if (m_lock.try_lock()) {
                 m_owner.store(curthread, std::memory_order_release);
                 return 0;

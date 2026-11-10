@@ -5,6 +5,7 @@
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
 
+#include "common/thread.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
@@ -430,7 +431,7 @@ int EqueueInternal::WaitForSmallTimer(OrbisKernelEvent* ev, int num, u32 micros)
             if (count > 0)
                 return count;
         }
-        std::this_thread::yield();
+        Common::YieldThread();
     } while (curr_clock < wait_end_us);
 
     return 0;

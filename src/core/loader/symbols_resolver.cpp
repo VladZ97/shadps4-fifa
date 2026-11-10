@@ -11,6 +11,7 @@
 namespace Core::Loader {
 
 void SymbolsResolver::AddSymbol(const SymbolResolver& s, u64 virtual_addr) {
+    m_by_name[s.name].push_back(static_cast<u32>(m_symbols.size()));
     m_symbols.emplace_back(s, virtual_addr);
 }
 
@@ -32,7 +33,11 @@ std::string_view SymbolsResolver::SymbolTypeToS(SymbolType sym_type) {
 }
 
 const SymbolRecord* SymbolsResolver::FindSymbol(const SymbolResolver& s) const {
-    for (u32 i = 0; i < m_symbols.size(); i++) {
+    const auto it = m_by_name.find(s.name);
+    if (it == m_by_name.end()) {
+        return nullptr;
+    }
+    for (const u32 i : it->second) {
         if (m_symbols[i].symbol == s) {
             return &m_symbols[i];
         }

@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <atomic>
 #include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -684,7 +686,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         }
         ASSERT_MSG(remaining_size == 0, "Failed to map physical memory");
     } else if (type == VMAType::Direct) {
-        if (std::getenv("BB_VB_LOG")) {
+        if (std::getenv("BB_VB_LOG") || std::getenv("BB_MPROT_LOG")) {
             bool aliased = false;
             for (auto d = FindDmemArea(phys_addr);
                  d != dmem_map.end() && d->second.base < phys_addr + size; ++d) {
@@ -1109,6 +1111,17 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     const auto adjusted_size = std::min<u64>(vma_base.size - start_in_vma, size);
     const MemoryProt old_prot = vma_base.prot;
     const MemoryProt new_prot = prot;
+    // g28 diagnostic (BB_MPROT_LOG=1): the guest's own protection changes. A changed protection is
+    // applied to the address space as is, over whatever the GPU page tracking had set there.
+    if (static const bool log = std::getenv("BB_MPROT_LOG") != nullptr; log) {
+        static std::atomic<int> lines{0};
+        if (lines++ < 4000) {
+            std::printf("[MPROT] %#llx+%#llx type %d prot %#x -> %#x%s\n", (unsigned long long)addr,
+                        (unsigned long long)adjusted_size, int(vma_base.type), u32(old_prot), u32(new_prot),
+                        new_prot != old_prot ? " applied" : "");
+            std::fflush(stdout);
+        }
+    }
 
     if (vma_base.type == VMAType::Free || vma_base.type == VMAType::PoolReserved) {
         // On PS4, protecting freed memory does nothing.
